@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// Общее состояние
 struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
@@ -23,17 +22,12 @@ struct AppState {
     pub filler_words: Mutex<String>,
 }
 
-// Перечисление для наших вкладок
 #[derive(PartialEq)]
 enum AppTab {
     Main,
     ApiKey,
     FillerWords,
 }
-
-// ---------------------------------------------------------------------------
-// АУДИО И API (Без изменений)
-// ---------------------------------------------------------------------------
 
 fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
     let host = cpal::default_host();
@@ -53,7 +47,6 @@ fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
 
     let audio_data: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let audio_data_clone = audio_data.clone();
-
     let state_for_stream = state.clone();
 
     let stream = match device.build_input_stream(
@@ -133,6 +126,7 @@ fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
 
     sink.as_slice().to_vec()
 }
+
 async fn process_audio_pipeline(
     client: &reqwest::Client,
     audio_bytes: Vec<u8>,
@@ -147,8 +141,7 @@ async fn process_audio_pipeline(
         .text("model", "whisper-large-v3-turbo")
         .text("language", "ru")
         .part("file", part);
-
-    let res = client
+let res = client
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {}", api_key))
         .multipart(form)
@@ -204,13 +197,10 @@ fn paste_text(text: &str) {
     let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
 }
 
-// ---------------------------------------------------------------------------
-// GUI ПРИЛОЖЕНИЕ (EGUI)
-// ---------------------------------------------------------------------------
-
 struct VoiceGUI {
     state: Arc<AppState>,
-    active_tab: AppTab, // Добавили отслеживание текущей вкладки
+    active_tab: AppTab,
+    show_widget: Arc<AtomicBool>,
 }
 
 impl VoiceGUI {
@@ -231,7 +221,8 @@ impl VoiceGUI {
 
         Self { 
             state,
-            active_tab: AppTab::Main, // По умолчанию открыта главная вкладка
+            active_tab: AppTab::Main,
+            show_widget: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -239,29 +230,25 @@ impl VoiceGUI {
 impl eframe::App for VoiceGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Изменили название на VoiceAI
             ui.heading("🎙 VoiceAI");
             ui.separator();
 
-            // --- ПАНЕЛЬ ВКЛАДОК ---
             ui.horizontal(|ui| {
-ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
+                ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
                 ui.selectable_value(&mut self.active_tab, AppTab::ApiKey, "API Ключ");
                 ui.selectable_value(&mut self.active_tab, AppTab::FillerWords, "Слова-паразиты");
             });
             ui.separator();
             ui.add_space(5.0);
 
-            // --- СОДЕРЖИМОЕ ВКЛАДОК ---
             match self.active_tab {
                 AppTab::Main => {
-                    // Статус сдвинулся наверх на место настроек
                     let status = self.state.status.lock().unwrap().clone();
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Статус:").strong());
                         let color = if status.contains("Запись") {
                             egui::Color32::RED
-                        } else if status.contains("Обработка") {
+} else if status.contains("Обработка") {
                             egui::Color32::YELLOW
                         } else {
                             egui::Color32::GREEN
@@ -269,10 +256,16 @@ ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
                         ui.label(egui::RichText::new(status).color(color));
                     });
 
+                    ui.add_space(5.0);
+                    
+                    let mut show_w = self.show_widget.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut show_w, "🪟 Включить мини-виджет поверх всех окон").changed() {
+                        self.show_widget.store(show_w, Ordering::Relaxed);
+                    }
+
                     ui.add_space(10.0);
                     ui.separator();
 
-                    // История сразу под статусом
                     ui.label(egui::RichText::new("История распознавания:").strong());
                     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                         let history = self.state.history.lock().unwrap();
@@ -285,7 +278,6 @@ ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
                     ui.label(egui::RichText::new("Настройка API Ключа (Groq):").strong());
                     ui.add_space(5.0);
                     let mut api_key = self.state.api_key.lock().unwrap();
-                    // Поле ввода на всю ширину
                     ui.add(egui::TextEdit::singleline(&mut *api_key).password(true).desired_width(f32::INFINITY));
                 }
                 AppTab::FillerWords => {
@@ -297,12 +289,53 @@ ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
                 }
             }
         });
+
+        // Отрисовка плавающего виджета
+        if self.show_widget.load(Ordering::Relaxed) {
+            let status = self.state.status.lock().unwrap().clone();
+            let is_rec = status.contains("Запись");
+            let is_proc = status.contains("Обработка");
+            let show_widget_clone = self.show_widget.clone();
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("floating_status_widget"),
+                egui::ViewportBuilder::default()
+                    .with_inner_size([190.0, 42.0])
+                    .with_always_on_top()
+                    .with_decorations(false)
+                    .with_transparent(true),
+                |ctx, _class| {
+                    let mut style = (*ctx.style()).clone();
+                    style.visuals.window_fill = egui::Color32::from_black_alpha(220);
+                    ctx.set_style(style);
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+
+                            if is_rec {
+                                ui.label("🔴");
+                                ui.label(egui::RichText::new("Запись...").color(egui::Color32::RED).strong());
+                            } else if is_proc {
+                                ui.label("⚙️");
+                                ui.label(egui::RichText::new("Обработка...").color(egui::Color32::YELLOW).strong());
+                            } else {
+                                ui.label("🟢");
+                                ui.label(egui::RichText::new("Готов (F9)").color(egui::Color32::GREEN));
+                            }
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+if ui.small_button("✖").clicked() {
+                                    show_widget_clone.store(false, Ordering::Relaxed);
+                                }
+                            });
+                        });
+                    });
+                },
+            );
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ФОНОВЫЕ ПОТОКИ (Клавиатура + Аудио/API)
-// ---------------------------------------------------------------------------
 
 fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     let state_for_keys = state.clone();
@@ -324,12 +357,16 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                     ctx_for_keys.request_repaint();
                 }
             }
+            EventType::KeyPress(Key::F12) => {
+                std::process::exit(0);
+            }
             _ => {}
         }) {
             eprintln!("Ошибка слушателя клавиатуры: {:?}", e);
         }
     });
-thread::spawn(move || {
+
+    thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let client = reqwest::Client::new();
@@ -379,7 +416,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([450.0, 400.0])
-            .with_title("VoiceAI"), // Изменили заголовок окна
+            .with_title("VoiceAI"),
         ..Default::default()
     };
 
