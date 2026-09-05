@@ -1,6 +1,9 @@
+#![windows_subsystem = "windows"]
+
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
+use eframe::egui;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use rdev::{simulate, EventType, Key};
@@ -9,19 +12,33 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+// Общее состояние
+struct AppState {
+    pub is_recording: AtomicBool,
+    pub status: Mutex<String>,
+    pub history: Mutex<Vec<String>>,
+    pub api_key: Mutex<String>,
+    pub filler_words: Mutex<String>,
+}
 
-fn record_audio_until_stopped() -> Vec<u8> {
+// Перечисление для наших вкладок
+#[derive(PartialEq)]
+enum AppTab {
+    Main,
+    ApiKey,
+    FillerWords,
+}
+
+// ---------------------------------------------------------------------------
+// АУДИО И API (Без изменений)
+// ---------------------------------------------------------------------------
+
+fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
     let host = cpal::default_host();
     let device = match host.default_input_device() {
-        Some(d) => {
-            if let Ok(name) = d.name() {
-                println!("[🎙️] Микрофон: {}", name);
-            }
-            d
-        }
+        Some(d) => d,
         None => return Vec::new(),
     };
 
@@ -37,10 +54,12 @@ fn record_audio_until_stopped() -> Vec<u8> {
     let audio_data: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let audio_data_clone = audio_data.clone();
 
+    let state_for_stream = state.clone();
+
     let stream = match device.build_input_stream(
         &config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            if IS_RECORDING.load(Ordering::SeqCst) {
+            if state_for_stream.is_recording.load(Ordering::SeqCst) {
                 let mut buffer = audio_data_clone.lock().unwrap();
                 buffer.extend_from_slice(data);
             }
@@ -56,20 +75,17 @@ fn record_audio_until_stopped() -> Vec<u8> {
         return Vec::new();
     }
 
-    while IS_RECORDING.load(Ordering::SeqCst) {
+    while state.is_recording.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(50));
     }
 
     drop(stream);
-
-    let t_processing = Instant::now();
 
     let raw_samples = audio_data.lock().unwrap();
     if raw_samples.is_empty() {
         return Vec::new();
     }
 
-    // 1. Моно конвертация
     let mut mono_samples = Vec::new();
     if native_channels > 1 {
         for chunk in raw_samples.chunks(native_channels) {
@@ -80,7 +96,6 @@ fn record_audio_until_stopped() -> Vec<u8> {
         mono_samples = raw_samples.clone();
     }
 
-    // 2. Ресемплинг в 16000 Гц
     let target_sample_rate = 16000;
     let mut resampled_samples = Vec::new();
     if native_sample_rate != target_sample_rate {
@@ -94,7 +109,6 @@ fn record_audio_until_stopped() -> Vec<u8> {
         resampled_samples = mono_samples;
     }
 
-    // 3. Кодирование в FLAC (без потерь, но заметно легче WAV)
     let samples_i32: Vec<i32> = resampled_samples
         .iter()
         .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i32)
@@ -106,8 +120,8 @@ fn record_audio_until_stopped() -> Vec<u8> {
 
     let source = flacenc::source::MemSource::from_samples(
         &samples_i32,
-        1, // mono
-        16, // bits per sample
+        1,
+        16,
         target_sample_rate as usize,
     );
 
@@ -115,28 +129,16 @@ fn record_audio_until_stopped() -> Vec<u8> {
         .expect("Ошибка кодирования FLAC");
 
     let mut sink = flacenc::bitsink::ByteSink::new();
-    flac_stream
-        .write(&mut sink)
-        .expect("Ошибка записи FLAC-потока");
+    flac_stream.write(&mut sink).expect("Ошибка записи FLAC");
 
-    let flac_bytes = sink.as_slice().to_vec();
-
-    println!(
-        "[⏱️] Только обработка аудио (ресемплинг + FLAC): {:?}",
-        t_processing.elapsed()
-    );
-
-    flac_bytes
+    sink.as_slice().to_vec()
 }
-
 async fn process_audio_pipeline(
     client: &reqwest::Client,
     audio_bytes: Vec<u8>,
     api_key: &str,
     filler_words: &[String],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let t0 = Instant::now();
-
     let part = multipart::Part::bytes(audio_bytes)
         .file_name("speech.flac")
         .mime_str("audio/flac")?;
@@ -145,9 +147,6 @@ async fn process_audio_pipeline(
         .text("model", "whisper-large-v3-turbo")
         .text("language", "ru")
         .part("file", part);
-
-    println!("[⏱️] Подготовка формы: {:?}", t0.elapsed());
-    let t1 = Instant::now();
 
     let res = client
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
@@ -158,19 +157,12 @@ async fn process_audio_pipeline(
         .json::<Value>()
         .await?;
 
-    println!("[⏱️] Запрос к Whisper: {:?}", t1.elapsed());
-
     let raw_text = match res["text"].as_str() {
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => return Ok(String::new()),
     };
 
-    println!("[🗣️ Распознано]: {}", raw_text);
-
-    let t2 = Instant::now();
     let cleaned_text = clean_text_locally(&raw_text, filler_words);
-    println!("[⏱️] Локальная очистка: {:?}", t2.elapsed());
-
     Ok(cleaned_text)
 }
 
@@ -189,7 +181,6 @@ fn clean_text_locally(raw_text: &str, filler_words: &[String]) -> String {
     }
 
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-
     let mut result = cleaned.trim().to_string();
     if let Some(first_char) = result.chars().next() {
         result.replace_range(0..first_char.len_utf8(), &first_char.to_uppercase().to_string());
@@ -197,21 +188,15 @@ fn clean_text_locally(raw_text: &str, filler_words: &[String]) -> String {
     if !result.is_empty() && !result.ends_with(['.', '!', '?']) {
         result.push('.');
     }
-
     result
 }
 
 fn paste_text(text: &str) {
-    if text.is_empty() {
-        return;
-    }
-
+    if text.is_empty() { return; }
     if let Ok(mut clipboard) = Clipboard::new() {
         let _ = clipboard.set_text(text.to_string());
     }
-
     thread::sleep(Duration::from_millis(150));
-
     let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
     let _ = simulate(&EventType::KeyPress(Key::KeyV));
     thread::sleep(Duration::from_millis(20));
@@ -219,70 +204,188 @@ fn paste_text(text: &str) {
     let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
 }
 
-#[tokio::main]
-async fn main() {
-    dotenvy::dotenv().ok();
-    let api_key = std::env::var("GROQ_API_KEY").expect("GROQ_API_KEY не установлен");
-    let filler_words_raw = std::env::var("FILLER_WORDS")
-        .unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
-    let filler_words: Vec<String> = filler_words_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
-    let client = reqwest::Client::new();
+// ---------------------------------------------------------------------------
+// GUI ПРИЛОЖЕНИЕ (EGUI)
+// ---------------------------------------------------------------------------
 
-    println!("==================================================");
-    println!(">>> Whisper Flow запущен и ожидает F9 (удерживайте)...");
-    println!(">>> F12 — выход");
-    println!("==================================================");
+struct VoiceGUI {
+    state: Arc<AppState>,
+    active_tab: AppTab, // Добавили отслеживание текущей вкладки
+}
+
+impl VoiceGUI {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        dotenvy::dotenv().ok();
+        let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+        let filler_words = std::env::var("FILLER_WORDS").unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
+
+        let state = Arc::new(AppState {
+            is_recording: AtomicBool::new(false),
+            status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
+            history: Mutex::new(Vec::new()),
+            api_key: Mutex::new(api_key),
+            filler_words: Mutex::new(filler_words),
+        });
+
+        start_background_workers(state.clone(), cc.egui_ctx.clone());
+
+        Self { 
+            state,
+            active_tab: AppTab::Main, // По умолчанию открыта главная вкладка
+        }
+    }
+}
+
+impl eframe::App for VoiceGUI {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Изменили название на VoiceAI
+            ui.heading("🎙 VoiceAI");
+            ui.separator();
+
+            // --- ПАНЕЛЬ ВКЛАДОК ---
+            ui.horizontal(|ui| {
+ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
+                ui.selectable_value(&mut self.active_tab, AppTab::ApiKey, "API Ключ");
+                ui.selectable_value(&mut self.active_tab, AppTab::FillerWords, "Слова-паразиты");
+            });
+            ui.separator();
+            ui.add_space(5.0);
+
+            // --- СОДЕРЖИМОЕ ВКЛАДОК ---
+            match self.active_tab {
+                AppTab::Main => {
+                    // Статус сдвинулся наверх на место настроек
+                    let status = self.state.status.lock().unwrap().clone();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Статус:").strong());
+                        let color = if status.contains("Запись") {
+                            egui::Color32::RED
+                        } else if status.contains("Обработка") {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::GREEN
+                        };
+                        ui.label(egui::RichText::new(status).color(color));
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    // История сразу под статусом
+                    ui.label(egui::RichText::new("История распознавания:").strong());
+                    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                        let history = self.state.history.lock().unwrap();
+                        for entry in history.iter() {
+                            ui.label(entry);
+                        }
+                    });
+                }
+                AppTab::ApiKey => {
+                    ui.label(egui::RichText::new("Настройка API Ключа (Groq):").strong());
+                    ui.add_space(5.0);
+                    let mut api_key = self.state.api_key.lock().unwrap();
+                    // Поле ввода на всю ширину
+                    ui.add(egui::TextEdit::singleline(&mut *api_key).password(true).desired_width(f32::INFINITY));
+                }
+                AppTab::FillerWords => {
+                    ui.label(egui::RichText::new("Список слов-паразитов:").strong());
+                    ui.label(egui::RichText::new("(через запятую, без пробелов после запятой)").small().color(egui::Color32::GRAY));
+                    ui.add_space(5.0);
+                    let mut filler = self.state.filler_words.lock().unwrap();
+                    ui.add(egui::TextEdit::multiline(&mut *filler).desired_width(f32::INFINITY));
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ФОНОВЫЕ ПОТОКИ (Клавиатура + Аудио/API)
+// ---------------------------------------------------------------------------
+
+fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
+    let state_for_keys = state.clone();
+    let ctx_for_keys = ctx.clone();
 
     thread::spawn(move || {
         if let Err(e) = rdev::listen(move |event| match event.event_type {
             EventType::KeyPress(Key::F9) => {
-                if !IS_RECORDING.load(Ordering::SeqCst) {
-                    IS_RECORDING.store(true, Ordering::SeqCst);
-                    println!("\n[🎤] Запись начата... Говорите!");
+                if !state_for_keys.is_recording.load(Ordering::SeqCst) {
+                    state_for_keys.is_recording.store(true, Ordering::SeqCst);
+                    *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
+                    ctx_for_keys.request_repaint(); 
                 }
             }
             EventType::KeyRelease(Key::F9) => {
-                if IS_RECORDING.load(Ordering::SeqCst) {
-                    IS_RECORDING.store(false, Ordering::SeqCst);
-                    println!("[🛑] Запись остановлена. Обработка...");
+                if state_for_keys.is_recording.load(Ordering::SeqCst) {
+                    state_for_keys.is_recording.store(false, Ordering::SeqCst);
+                    *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
+                    ctx_for_keys.request_repaint();
                 }
-            }
-            EventType::KeyPress(Key::F12) => {
-                println!("\n[👋] Завершение работы Whisper Flow...");
-                std::process::exit(0);
             }
             _ => {}
         }) {
-            eprintln!("[❌] Ошибка слушателя клавиатуры: {:?}", e);
+            eprintln!("Ошибка слушателя клавиатуры: {:?}", e);
         }
     });
+thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let client = reqwest::Client::new();
 
-    loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
 
-        if IS_RECORDING.load(Ordering::SeqCst) {
-            let t_rec = Instant::now();
-            let audio_bytes = tokio::task::spawn_blocking(record_audio_until_stopped)
-                .await
-                .unwrap_or_default();
-            println!("[⏱️] Запись (включая удержание клавиши): {:?}", t_rec.elapsed());
+                if state.is_recording.load(Ordering::SeqCst) {
+                    let audio_bytes = tokio::task::spawn_blocking({
+                        let state_clone = state.clone();
+                        move || record_audio_until_stopped(state_clone)
+                    })
+                    .await
+                    .unwrap_or_default();
 
-            if !audio_bytes.is_empty() && !api_key.is_empty() {
-                match process_audio_pipeline(&client, audio_bytes, &api_key, &filler_words).await {
-                    Ok(final_text) => {
-                        if !final_text.is_empty() {
-                            println!("[✨ Готово]: {}", final_text);
-                            paste_text(&final_text);
-                        } else {
-                            println!("[ℹ️] Пустой результат.");
+                    let api_key = state.api_key.lock().unwrap().clone();
+                    let words_raw = state.filler_words.lock().unwrap().clone();
+                    
+                    if !audio_bytes.is_empty() && !api_key.is_empty() {
+                        let filler_words: Vec<String> = words_raw
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .collect();
+
+                        match process_audio_pipeline(&client, audio_bytes, &api_key, &filler_words).await {
+                            Ok(final_text) => {
+                                if !final_text.is_empty() {
+                                    paste_text(&final_text);
+                                    state.history.lock().unwrap().push(final_text);
+                                }
+                            }
+                            Err(e) => {
+                                state.history.lock().unwrap().push(format!("❌ Ошибка: {}", e));
+                            }
                         }
                     }
-                    Err(e) => eprintln!("[❌] Ошибка конвейера: {}", e),
+
+                    *state.status.lock().unwrap() = "🟢 Ожидание (Зажмите F9)".to_string();
+                    ctx.request_repaint(); 
                 }
             }
-        }
-    }
+        });
+    });
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([450.0, 400.0])
+            .with_title("VoiceAI"), // Изменили заголовок окна
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "VoiceAI",
+        options,
+        Box::new(|cc| Box::new(VoiceGUI::new(cc))),
+    )
 }
