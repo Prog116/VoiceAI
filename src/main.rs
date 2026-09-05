@@ -1,11 +1,11 @@
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
-use hound::{WavSpec, WavWriter};
+use flacenc::component::BitRepr;
+use flacenc::error::Verify;
 use rdev::{simulate, EventType, Key};
 use reqwest::multipart;
 use serde_json::Value;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -94,44 +94,52 @@ fn record_audio_until_stopped() -> Vec<u8> {
         resampled_samples = mono_samples;
     }
 
-    // 3. Формирование WAV
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: target_sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
+    // 3. Кодирование в FLAC (без потерь, но заметно легче WAV)
+    let samples_i32: Vec<i32> = resampled_samples
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i32)
+        .collect();
 
-    let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
-        for &sample in resampled_samples.iter() {
-            let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            writer.write_sample(sample_i16).unwrap();
-        }
-        writer.finalize().unwrap();
-    }
+    let config = flacenc::config::Encoder::default()
+        .into_verified()
+        .expect("Ошибка конфигурации FLAC-энкодера");
 
-    let wav_bytes = cursor.into_inner();
+    let source = flacenc::source::MemSource::from_samples(
+        &samples_i32,
+        1, // mono
+        16, // bits per sample
+        target_sample_rate as usize,
+    );
+
+    let flac_stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .expect("Ошибка кодирования FLAC");
+
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    flac_stream
+        .write(&mut sink)
+        .expect("Ошибка записи FLAC-потока");
+
+    let flac_bytes = sink.as_slice().to_vec();
+
     println!(
-        "[⏱️] Только обработка аудио (без записи): {:?}",
+        "[⏱️] Только обработка аудио (ресемплинг + FLAC): {:?}",
         t_processing.elapsed()
     );
 
-    wav_bytes
+    flac_bytes
 }
 
 async fn process_audio_pipeline(
     client: &reqwest::Client,
-    wav_bytes: Vec<u8>,
+    audio_bytes: Vec<u8>,
     api_key: &str,
     filler_words: &[String],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let t0 = Instant::now();
 
-    let part = multipart::Part::bytes(wav_bytes)
-        .file_name("speech.wav")
-        .mime_str("audio/wav")?;
+    let part = multipart::Part::bytes(audio_bytes)
+        .file_name("speech.flac")
+        .mime_str("audio/flac")?;
 
     let form = multipart::Form::new()
         .text("model", "whisper-large-v3-turbo")
@@ -257,13 +265,13 @@ async fn main() {
 
         if IS_RECORDING.load(Ordering::SeqCst) {
             let t_rec = Instant::now();
-            let wav_bytes = tokio::task::spawn_blocking(record_audio_until_stopped)
+            let audio_bytes = tokio::task::spawn_blocking(record_audio_until_stopped)
                 .await
                 .unwrap_or_default();
             println!("[⏱️] Запись (включая удержание клавиши): {:?}", t_rec.elapsed());
 
-            if !wav_bytes.is_empty() && !api_key.is_empty() {
-                match process_audio_pipeline(&client, wav_bytes, &api_key, &filler_words).await {
+            if !audio_bytes.is_empty() && !api_key.is_empty() {
+                match process_audio_pipeline(&client, audio_bytes, &api_key, &filler_words).await {
                     Ok(final_text) => {
                         if !final_text.is_empty() {
                             println!("[✨ Готово]: {}", final_text);
