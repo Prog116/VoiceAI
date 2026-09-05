@@ -1,0 +1,15 @@
+[package]
+name = "whisper_flow_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dotenvy = "0.15"
+tokio = { version = "1.38", features = ["full"] }
+cpal = "0.15"
+hound = "3.5"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rdev = "0.5"
+arboard = "3.4"
