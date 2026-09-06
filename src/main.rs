@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -141,7 +141,8 @@ async fn process_audio_pipeline(
         .text("model", "whisper-large-v3-turbo")
         .text("language", "ru")
         .part("file", part);
-let res = client
+
+    let res = client
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {}", api_key))
         .multipart(form)
@@ -184,8 +185,17 @@ fn clean_text_locally(raw_text: &str, filler_words: &[String]) -> String {
     result
 }
 
+fn parse_filler_words(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn paste_text(text: &str) {
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
     if let Ok(mut clipboard) = Clipboard::new() {
         let _ = clipboard.set_text(text.to_string());
     }
@@ -219,7 +229,7 @@ impl VoiceGUI {
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
 
-        Self { 
+        Self {
             state,
             active_tab: AppTab::Main,
             show_widget: Arc::new(AtomicBool::new(false)),
@@ -248,7 +258,7 @@ impl eframe::App for VoiceGUI {
                         ui.label(egui::RichText::new("Статус:").strong());
                         let color = if status.contains("Запись") {
                             egui::Color32::RED
-} else if status.contains("Обработка") {
+                        } else if status.contains("Обработка") {
                             egui::Color32::YELLOW
                         } else {
                             egui::Color32::GREEN
@@ -257,7 +267,7 @@ impl eframe::App for VoiceGUI {
                     });
 
                     ui.add_space(5.0);
-                    
+
                     let mut show_w = self.show_widget.load(Ordering::Relaxed);
                     if ui.checkbox(&mut show_w, "🪟 Включить мини-виджет поверх всех окон").changed() {
                         self.show_widget.store(show_w, Ordering::Relaxed);
@@ -290,7 +300,6 @@ impl eframe::App for VoiceGUI {
             }
         });
 
-        // Отрисовка плавающего виджета
         if self.show_widget.load(Ordering::Relaxed) {
             let status = self.state.status.lock().unwrap().clone();
             let is_rec = status.contains("Запись");
@@ -325,7 +334,7 @@ impl eframe::App for VoiceGUI {
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-if ui.small_button("✖").clicked() {
+                                if ui.small_button("✖").clicked() {
                                     show_widget_clone.store(false, Ordering::Relaxed);
                                 }
                             });
@@ -347,7 +356,7 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                 if !state_for_keys.is_recording.load(Ordering::SeqCst) {
                     state_for_keys.is_recording.store(true, Ordering::SeqCst);
                     *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
-                    ctx_for_keys.request_repaint(); 
+                    ctx_for_keys.request_repaint();
                 }
             }
             EventType::KeyRelease(Key::F9) => {
@@ -384,12 +393,9 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
 
                     let api_key = state.api_key.lock().unwrap().clone();
                     let words_raw = state.filler_words.lock().unwrap().clone();
-                    
+
                     if !audio_bytes.is_empty() && !api_key.is_empty() {
-                        let filler_words: Vec<String> = words_raw
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect();
+                        let filler_words = parse_filler_words(&words_raw);
 
                         match process_audio_pipeline(&client, audio_bytes, &api_key, &filler_words).await {
                             Ok(final_text) => {
@@ -405,7 +411,7 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                     }
 
                     *state.status.lock().unwrap() = "🟢 Ожидание (Зажмите F9)".to_string();
-                    ctx.request_repaint(); 
+                    ctx.request_repaint();
                 }
             }
         });
@@ -425,4 +431,62 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(VoiceGUI::new(cc))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removes_single_filler_word() {
+        let filler_words = vec!["эм".to_string()];
+        let result = clean_text_locally("привет эм как дела", &filler_words);
+        assert_eq!(result, "Привет как дела.");
+    }
+
+    #[test]
+    fn removes_multiple_filler_words() {
+        let filler_words = vec!["эм".to_string(), "ну".to_string()];
+        let result = clean_text_locally("привет эм как ну дела", &filler_words);
+        assert_eq!(result, "Привет как дела.");
+    }
+
+    #[test]
+    fn leaves_text_without_filler_words_unchanged_but_punctuated() {
+        let filler_words = vec!["эм".to_string()];
+        let result = clean_text_locally("привет как дела", &filler_words);
+        assert_eq!(result, "Привет как дела.");
+    }
+
+    #[test]
+    fn does_not_duplicate_punctuation_if_already_present() {
+        let filler_words: Vec<String> = vec![];
+        let result = clean_text_locally("привет!", &filler_words);
+        assert_eq!(result, "Привет!");
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        let filler_words = vec!["эм".to_string()];
+        let result = clean_text_locally("", &filler_words);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn parses_comma_separated_filler_words() {
+        let result = parse_filler_words("эм,ну,как бы");
+        assert_eq!(result, vec!["эм", "ну", "как бы"]);
+    }
+
+    #[test]
+    fn trims_spaces_around_filler_words() {
+        let result = parse_filler_words("эм, ну , как бы");
+        assert_eq!(result, vec!["эм", "ну", "как бы"]);
+    }
+
+    #[test]
+    fn empty_filler_words_string_gives_empty_list() {
+        let result = parse_filler_words("");
+        assert_eq!(result, Vec::<String>::new());
+    }
 }
