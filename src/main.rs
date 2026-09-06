@@ -8,16 +8,80 @@ use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use rdev::{simulate, EventType, Key};
 use reqwest::multipart;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[derive(Serialize, Deserialize, Clone)]
+struct HistoryEntry {
+    text: String,
+    timestamp: u64, // unix-время, UTC
+    app: String,
+}
+
+const HISTORY_FILE: &str = "history.jsonl";
+const HISTORY_MAX_ENTRIES: usize = 2000;
+
+fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn load_history() -> Vec<HistoryEntry> {
+    let Ok(file) = std::fs::File::open(HISTORY_FILE) else {
+        return Vec::new();
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .filter_map(|line| line.ok())
+        .filter_map(|line| serde_json::from_str::<HistoryEntry>(&line).ok())
+        .collect()
+}
+
+fn append_history_entry(entry: &HistoryEntry) {
+    if let Ok(json) = serde_json::to_string(entry) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(HISTORY_FILE)
+        {
+            let _ = writeln!(file, "{}", json);
+        }
+    }
+}
+
+fn save_history_all(entries: &[HistoryEntry]) {
+    if let Ok(mut file) = std::fs::File::create(HISTORY_FILE) {
+        for entry in entries {
+            if let Ok(json) = serde_json::to_string(entry) {
+                let _ = writeln!(file, "{}", json);
+            }
+        }
+    }
+}
+
+fn export_history(entries: &[HistoryEntry]) -> std::io::Result<String> {
+    let filename = format!("export_{}.jsonl", unix_now());
+    let mut file = std::fs::File::create(&filename)?;
+    for entry in entries {
+        if let Ok(json) = serde_json::to_string(entry) {
+            writeln!(file, "{}", json)?;
+        }
+    }
+    Ok(filename)
+}
+
 struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
-    pub history: Mutex<Vec<String>>,
+    pub history: Mutex<Vec<HistoryEntry>>,
     pub api_key: Mutex<String>,
     pub filler_words: Mutex<String>,
 }
@@ -223,18 +287,20 @@ struct VoiceGUI {
     state: Arc<AppState>,
     active_tab: AppTab,
     show_widget: Arc<AtomicBool>,
+    search_query: String,
 }
 
 impl VoiceGUI {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         dotenvy::dotenv().ok();
         let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
-        let filler_words = std::env::var("FILLER_WORDS").unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
+        let filler_words = std::env::var("FILLER_WORDS")
+            .unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
 
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
             status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(load_history()),
             api_key: Mutex::new(api_key),
             filler_words: Mutex::new(filler_words),
         });
@@ -245,6 +311,7 @@ impl VoiceGUI {
             state,
             active_tab: AppTab::Main,
             show_widget: Arc::new(AtomicBool::new(false)),
+            search_query: String::new(),
         }
     }
 }
@@ -288,11 +355,41 @@ impl eframe::App for VoiceGUI {
                     ui.add_space(10.0);
                     ui.separator();
 
-                    ui.label(egui::RichText::new("История распознавания:").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("История:").strong());
+                        ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Поиск..."));
+                        if ui.button("🗑 Очистить всё").clicked() {
+                            self.state.history.lock().unwrap().clear();
+                            save_history_all(&[]);
+                        }
+                        if ui.button("💾 Экспорт").clicked() {
+                            let history = self.state.history.lock().unwrap();
+                            let _ = export_history(&history);
+                        }
+                    });
+
+                    ui.add_space(5.0);
+
                     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                        let history = self.state.history.lock().unwrap();
-                        for entry in history.iter() {
-                            ui.label(entry);
+                        let mut history = self.state.history.lock().unwrap();
+                        let query = self.search_query.to_lowercase();
+                        let mut to_delete: Option<usize> = None;
+
+                        for (i, entry) in history.iter().enumerate() {
+                            if !query.is_empty() && !entry.text.to_lowercase().contains(&query) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(&entry.text);
+                                if ui.small_button("✖").clicked() {
+                                    to_delete = Some(i);
+                                }
+                            });
+                        }
+
+                        if let Some(i) = to_delete {
+                            history.remove(i);
+                            save_history_all(&history);
                         }
                     });
                 }
@@ -330,7 +427,10 @@ impl eframe::App for VoiceGUI {
                     style.visuals.window_fill = egui::Color32::from_black_alpha(220);
                     ctx.set_style(style);
 
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut close_interacted = false; // Флаг для кнопки закрытия
+
+                    // Сохраняем response от CentralPanel
+                    let panel_response = egui::CentralPanel::default().show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -346,18 +446,27 @@ impl eframe::App for VoiceGUI {
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("✖").clicked() {
+                                let btn = ui.small_button("✖️");
+                                if btn.clicked() {
                                     show_widget_clone.store(false, Ordering::Relaxed);
+                                }
+                                // Проверяем, наведена ли мышь или нажата ли кнопка на крестике
+                                if btn.hovered() || btn.is_pointer_button_down_on() {
+                                    close_interacted = true;
                                 }
                             });
                         });
                     });
+
+                    // Если ЛКМ зажата в любой области виджета (но не на крестике закрытия)
+                    if panel_response.response.is_pointer_button_down_on() && !close_interacted {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); // Начинаем перетаскивание окна
+                    }
                 },
             );
         }
     }
 }
-
 fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     let state_for_keys = state.clone();
     let ctx_for_keys = ctx.clone();
@@ -413,11 +522,28 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                             Ok(final_text) => {
                                 if !final_text.is_empty() {
                                     paste_text(&final_text);
-                                    state.history.lock().unwrap().push(final_text);
+                                    let entry = HistoryEntry {
+                                        text: final_text.clone(),
+                                        timestamp: unix_now(),
+                                        app: "неизвестно".to_string(),
+                                    };
+                                    append_history_entry(&entry);
+                                    let mut history = state.history.lock().unwrap();
+                                    history.push(entry);
+                                    if history.len() > HISTORY_MAX_ENTRIES {
+                                        history.remove(0);
+                                        save_history_all(&history);
+                                    }
                                 }
                             }
                             Err(e) => {
-                                state.history.lock().unwrap().push(format!("❌ Ошибка: {}", e));
+                                let entry = HistoryEntry {
+                                    text: format!("❌ Ошибка: {}", e),
+                                    timestamp: unix_now(),
+                                    app: "system".to_string(),
+                                };
+                                append_history_entry(&entry);
+                                state.history.lock().unwrap().push(entry);
                             }
                         }
                     }
