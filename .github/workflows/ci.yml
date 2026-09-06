@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+        continue-on-error: true
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test

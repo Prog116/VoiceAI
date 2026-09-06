@@ -196,15 +196,27 @@ fn paste_text(text: &str) {
     if text.is_empty() {
         return;
     }
-    if let Ok(mut clipboard) = Clipboard::new() {
-        let _ = clipboard.set_text(text.to_string());
-    }
+
+    let mut clipboard = match Clipboard::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let previous_clipboard = clipboard.get_text().ok();
+
+    let _ = clipboard.set_text(text.to_string());
     thread::sleep(Duration::from_millis(150));
+
     let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
     let _ = simulate(&EventType::KeyPress(Key::KeyV));
     thread::sleep(Duration::from_millis(20));
     let _ = simulate(&EventType::KeyRelease(Key::KeyV));
     let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+
+    thread::sleep(Duration::from_millis(100));
+    if let Some(prev) = previous_clipboard {
+        let _ = clipboard.set_text(prev);
+    }
 }
 
 struct VoiceGUI {
