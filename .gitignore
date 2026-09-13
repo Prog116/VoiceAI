@@ -1,3 +1,5 @@
 /target
 .env
 *.wav
+history.jsonl
+models/

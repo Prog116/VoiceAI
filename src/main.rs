@@ -4,12 +4,11 @@ use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 use eframe::egui;
-use flacenc::component::BitRepr;
-use flacenc::error::Verify;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
 use rdev::{simulate, EventType, Key};
-use reqwest::multipart;
+use rfd;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,8 +18,42 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone)]
 struct HistoryEntry {
     text: String,
-    timestamp: u64, // unix-время, UTC
+    timestamp: u64,
     app: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+struct WordReplacement {
+    from: String,
+    to: String,
+}
+
+fn parse_word_replacements(raw: &str) -> Vec<WordReplacement> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let parts: Vec<&str> = line.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                let from = parts[0].trim().to_string();
+                let to = parts[1].trim().to_string();
+                if !from.is_empty() {
+                    return Some(WordReplacement { from, to });
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn apply_word_replacements(text: &str, replacements: &[WordReplacement]) -> String {
+    let mut result = text.to_string();
+    for repl in replacements {
+        result = result.replace(&repl.from, &repl.to);
+    }
+    result
 }
 
 const HISTORY_FILE: &str = "history.jsonl";
@@ -82,18 +115,20 @@ struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
     pub history: Mutex<Vec<HistoryEntry>>,
-    pub api_key: Mutex<String>,
+    pub model_path: Mutex<String>,
     pub filler_words: Mutex<String>,
+    pub word_replacements: Mutex<String>,
+    pub whisper_ctx: Mutex<Option<WhisperContext>>,
+    pub mic_gain: Mutex<f32>,
 }
 
 #[derive(PartialEq)]
 enum AppTab {
     Main,
-    ApiKey,
-    FillerWords,
+    Settings,
 }
 
-fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
+fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<f32> {
     let host = cpal::default_host();
     let device = match host.default_input_device() {
         Some(d) => d,
@@ -153,75 +188,133 @@ fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<u8> {
         mono_samples = raw_samples.clone();
     }
 
-    let target_sample_rate = 16000;
-    let mut resampled_samples = Vec::new();
-    if native_sample_rate != target_sample_rate {
-        let ratio = native_sample_rate as f64 / target_sample_rate as f64;
-        let mut i = 0.0;
-        while (i as usize) < mono_samples.len() {
-            resampled_samples.push(mono_samples[i as usize]);
-            i += ratio;
-        }
-    } else {
-        resampled_samples = mono_samples;
-    }
-
-    let samples_i32: Vec<i32> = resampled_samples
-        .iter()
-        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i32)
-        .collect();
-
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .expect("Ошибка конфигурации FLAC-энкодера");
-
-    let source = flacenc::source::MemSource::from_samples(
-        &samples_i32,
-        1,
-        16,
-        target_sample_rate as usize,
-    );
-
-    let flac_stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-        .expect("Ошибка кодирования FLAC");
-
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    flac_stream.write(&mut sink).expect("Ошибка записи FLAC");
-
-    sink.as_slice().to_vec()
+    let processed_samples = process_audio_samples(&mono_samples, native_sample_rate, *state.mic_gain.lock().unwrap());
+    processed_samples
 }
 
-async fn process_audio_pipeline(
-    client: &reqwest::Client,
-    audio_bytes: Vec<u8>,
-    api_key: &str,
-    filler_words: &[String],
-) -> Result<String, Box<dyn std::error::Error>> {
-    let part = multipart::Part::bytes(audio_bytes)
-        .file_name("speech.flac")
-        .mime_str("audio/flac")?;
+fn process_audio_samples(samples: &[f32], sample_rate: u32, gain: f32) -> Vec<f32> {
+    const TARGET_RATE: u32 = 16000;
+    const NOISE_GATE_THRESHOLD: f32 = 0.005; // Lowered threshold
 
-    let form = multipart::Form::new()
-        .text("model", "whisper-large-v3-turbo")
-        .text("language", "ru")
-        .part("file", part);
-
-    let res = client
-        .post("https://api.groq.com/openai/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .multipart(form)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-
-    let raw_text = match res["text"].as_str() {
-        Some(t) if !t.trim().is_empty() => t.to_string(),
-        _ => return Ok(String::new()),
+    let mut resampled = if sample_rate != TARGET_RATE {
+        resample_linear(samples, sample_rate, TARGET_RATE)
+    } else {
+        samples.to_vec()
     };
 
+    // Apply gain early to boost signal before noise gate
+    if gain > 1.0 {
+        for s in resampled.iter_mut() {
+            *s *= gain;
+        }
+    }
+
+    // Adaptive noise gate based on signal level
+    let rms = calculate_rms(&resampled);
+    let adaptive_threshold = (NOISE_GATE_THRESHOLD * (1.0 + rms * 2.0)).min(0.02);
+    apply_noise_gate(&mut resampled, adaptive_threshold);
+
+    // Aggressive normalization for whisper
+    normalize_audio_aggressive(&mut resampled);
+
+    resampled
+}
+
+fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate {
+        return input.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (input.len() as f64 / ratio).ceil() as usize;
+    let mut output = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f64;
+        if idx + 1 < input.len() {
+            let v = input[idx] * (1.0 - frac as f32) + input[idx + 1] * frac as f32;
+            output.push(v);
+        } else if idx < input.len() {
+            output.push(input[idx]);
+        }
+    }
+    output
+}
+
+fn calculate_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+fn apply_noise_gate(samples: &mut [f32], threshold: f32) {
+    for s in samples.iter_mut() {
+        if s.abs() < threshold {
+            *s = 0.0;
+        }
+    }
+}
+
+fn normalize_audio_aggressive(samples: &mut [f32]) {
+    let max_abs = samples.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    if max_abs > 0.0 {
+        // Target level for whisper (it works best with signals around -20dB to -6dB)
+        let target_level = 0.5; // -6dB
+        let gain = target_level / max_abs;
+        // Cap maximum gain to avoid amplifying noise too much
+        let gain = gain.clamp(0.5, 20.0);
+        for s in samples.iter_mut() {
+            *s *= gain;
+        }
+    }
+}
+
+fn process_audio_pipeline(
+    state: &Arc<AppState>,
+    audio_samples: &[f32],
+    filler_words: &[String],
+    word_replacements: &[WordReplacement],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ctx_guard = state.whisper_ctx.lock().unwrap();
+    let ctx = match ctx_guard.as_ref() {
+        Some(ctx) => ctx,
+        None => return Err("Модель не загружена".into()),
+    };
+
+    if audio_samples.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut whisper_state = ctx.create_state()?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("ru"));
+    params.set_translate(false);
+    params.set_no_timestamps(true);
+    params.set_single_segment(true);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+
+    whisper_state.full(params, audio_samples)?;
+
+    let num_segments = whisper_state.full_n_segments();
+    let mut raw_text = String::new();
+    for i in 0..num_segments {
+        if let Some(segment) = whisper_state.get_segment(i) {
+            raw_text.push_str(&segment.to_string());
+        }
+    }
+
+    let raw_text = raw_text.trim().to_string();
+    if raw_text.is_empty() {
+        return Ok(String::new());
+    }
+
     let cleaned_text = clean_text_locally(&raw_text, filler_words);
-    Ok(cleaned_text)
+    let final_text = apply_word_replacements(&cleaned_text, word_replacements);
+    Ok(final_text)
 }
 
 fn clean_text_locally(raw_text: &str, filler_words: &[String]) -> String {
@@ -288,77 +381,170 @@ struct VoiceGUI {
     active_tab: AppTab,
     show_widget: Arc<AtomicBool>,
     search_query: String,
+    dark_mode: bool,
 }
 
 impl VoiceGUI {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         dotenvy::dotenv().ok();
-        let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+        let model_path = std::env::var("WHISPER_MODEL_PATH")
+            .unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".to_string());
         let filler_words = std::env::var("FILLER_WORDS")
             .unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
+        let word_replacements = std::env::var("WORD_REPLACEMENTS")
+            .unwrap_or_else(|_| "дефис=-\nдвоеточие=:\nточка с запятой=;\nоткрывающая скобка=(\nзакрывающая скобка=)".to_string());
+
+        let whisper_ctx = WhisperContext::new_with_params(
+            &model_path,
+            WhisperContextParameters::default(),
+        ).ok();
+
+        if whisper_ctx.is_none() {
+            eprintln!("Не удалось загрузить модель: {}", model_path);
+        } else {
+            println!("Модель загружена успешно: {}", model_path);
+        }
 
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
             status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
             history: Mutex::new(load_history()),
-            api_key: Mutex::new(api_key),
+            model_path: Mutex::new(model_path),
             filler_words: Mutex::new(filler_words),
+            word_replacements: Mutex::new(word_replacements),
+            whisper_ctx: Mutex::new(whisper_ctx),
+            mic_gain: Mutex::new(10.0), // Default gain multiplier
         });
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
+        start_widget_repaint_loop(cc.egui_ctx.clone());
 
         Self {
             state,
             active_tab: AppTab::Main,
             show_widget: Arc::new(AtomicBool::new(false)),
             search_query: String::new(),
+            dark_mode: true,
         }
     }
 }
 
+fn start_widget_repaint_loop(ctx: egui::Context) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            ctx.request_repaint();
+        }
+    });
+}
+
 impl eframe::App for VoiceGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("🎙 VoiceAI");
-            ui.separator();
+        let mut style = (*ctx.style()).clone();
+        style.visuals.window_fill = egui::Color32::from_rgb(28, 28, 30);
+        style.visuals.panel_fill = egui::Color32::from_rgb(32, 32, 36);
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(40, 40, 44);
+        style.visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(40, 40, 44);
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 52);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 68);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(70, 130, 180);
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(70, 130, 180);
+        style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(220, 220, 220);
+        style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+        style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(20.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ctx.set_style(style);
 
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, AppTab::Main, "Главная");
-                ui.selectable_value(&mut self.active_tab, AppTab::ApiKey, "API Ключ");
-                ui.selectable_value(&mut self.active_tab, AppTab::FillerWords, "Слова-паразиты");
+        // Применяем тему
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
+        egui::SidePanel::left("side_panel")
+            .resizable(false)
+            .default_width(180.0)
+            .show(ctx, |ui| {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("🎙 VoiceAI").size(22.0).strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                });
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let main_btn = ui.selectable_label(self.active_tab == AppTab::Main, egui::RichText::new("🏠  Главная").size(15.0));
+                    if main_btn.clicked() {
+                        self.active_tab = AppTab::Main;
+                    }
+                    let settings_btn = ui.selectable_label(self.active_tab == AppTab::Settings, egui::RichText::new("⚙  Настройки").size(15.0));
+                    if settings_btn.clicked() {
+                        self.active_tab = AppTab::Settings;
+                    }
+                });
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Горячие клавиши:").size(11.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("F9 — Запись (зажмите)").size(11.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("F12 — Выход").size(11.0).color(egui::Color32::GRAY));
+                });
             });
-            ui.separator();
-            ui.add_space(5.0);
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(10.0);
 
             match self.active_tab {
                 AppTab::Main => {
                     let status = self.state.status.lock().unwrap().clone();
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Статус:").strong());
+                        ui.add_space(15.0);
+                        ui.label(egui::RichText::new("Статус:").strong().size(15.0));
                         let color = if status.contains("Запись") {
-                            egui::Color32::RED
+                            egui::Color32::from_rgb(255, 80, 80)
                         } else if status.contains("Обработка") {
-                            egui::Color32::YELLOW
+                            egui::Color32::from_rgb(255, 200, 80)
                         } else {
-                            egui::Color32::GREEN
+                            egui::Color32::from_rgb(80, 255, 120)
                         };
-                        ui.label(egui::RichText::new(status).color(color));
+                        ui.label(egui::RichText::new(status).color(color).size(14.0));
                     });
 
-                    ui.add_space(5.0);
+                    ui.add_space(15.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(15.0);
+                        let mut show_w = self.show_widget.load(Ordering::Relaxed);
+                        if ui.checkbox(&mut show_w, "🪟 Мини-виджет поверх окон").changed() {
+                            self.show_widget.store(show_w, Ordering::Relaxed);
+                        }
+                    });
 
-                    let mut show_w = self.show_widget.load(Ordering::Relaxed);
-                    if ui.checkbox(&mut show_w, "🪟 Включить мини-виджет поверх всех окон").changed() {
-                        self.show_widget.store(show_w, Ordering::Relaxed);
-                    }
-
-                    ui.add_space(10.0);
+                    ui.add_space(15.0);
                     ui.separator();
+                    ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("История:").strong());
-                        ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Поиск..."));
-                        if ui.button("🗑 Очистить всё").clicked() {
+                        ui.add_space(15.0);
+                        ui.label(egui::RichText::new("История:").strong().size(15.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("🔍 Поиск...")
+                            .desired_width(200.0));
+                        if ui.button("🗑 Очистить").clicked() {
                             self.state.history.lock().unwrap().clear();
                             save_history_all(&[]);
                         }
@@ -368,43 +554,212 @@ impl eframe::App for VoiceGUI {
                         }
                     });
 
-                    ui.add_space(5.0);
+                    ui.add_space(10.0);
 
-                    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                        let mut history = self.state.history.lock().unwrap();
-                        let query = self.search_query.to_lowercase();
-                        let mut to_delete: Option<usize> = None;
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(5.0);
+                            let mut history = self.state.history.lock().unwrap();
+                            let query = self.search_query.to_lowercase();
+                            let mut to_delete: Option<usize> = None;
 
-                        for (i, entry) in history.iter().enumerate() {
-                            if !query.is_empty() && !entry.text.to_lowercase().contains(&query) {
-                                continue;
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label(&entry.text);
-                                if ui.small_button("✖").clicked() {
-                                    to_delete = Some(i);
+                            for (i, entry) in history.iter().enumerate() {
+                                if !query.is_empty() && !entry.text.to_lowercase().contains(&query) {
+                                    continue;
                                 }
-                            });
-                        }
+                                ui.horizontal(|ui| {
+                                    ui.add_space(15.0);
+                                    let response = ui.add(egui::Label::new(
+                                        egui::RichText::new(&entry.text).size(13.0)
+                                    ).sense(egui::Sense::click()));
+                                    if response.clicked() {
+                                        let mut clipboard = Clipboard::new().ok();
+                                        if let Some(cb) = clipboard.as_mut() {
+                                            let _ = cb.set_text(entry.text.clone());
+                                        }
+                                    }
+                                    if response.hovered() {
+                                        ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("✕").on_hover_text("Удалить").clicked() {
+                                            to_delete = Some(i);
+                                        }
+                                        if ui.small_button("📋").on_hover_text("Копировать").clicked() {
+                                            let mut clipboard = Clipboard::new().ok();
+                                            if let Some(cb) = clipboard.as_mut() {
+                                                let _ = cb.set_text(entry.text.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.add_space(2.0);
+                            }
 
-                        if let Some(i) = to_delete {
-                            history.remove(i);
-                            save_history_all(&history);
-                        }
+                            if let Some(i) = to_delete {
+                                history.remove(i);
+                                save_history_all(&history);
+                            }
+                        });
+                }
+                AppTab::Settings => {
+                    ui.add_space(10.0);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add_space(10.0);
+
+                        // Тема
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🎨 Тема интерфейса").strong().size(16.0));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let theme_text = if self.dark_mode { "🌙 Тёмная" } else { "☀️ Светлая" };
+                            if ui.button(egui::RichText::new(theme_text).size(14.0)).clicked() {
+                                self.dark_mode = !self.dark_mode;
+                            }
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Требуется перезапуск для полного применения").small().color(egui::Color32::GRAY));
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
+                        // Микрофон / Чувствительность
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🎤 Микрофон / Чувствительность").strong().size(16.0));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Усиление сигнала (gain):").size(13.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut gain = self.state.mic_gain.lock().unwrap();
+                            ui.add(egui::Slider::new(&mut *gain, 1.0..=50.0).text("x").suffix("x").step_by(1.0));
+                            ui.label(egui::RichText::new(format!("{:.0}x", *gain)).size(13.0).color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("💡 Начните с 10-15x. Увеличьте, если тихо; уменьшите, если шумит").small().color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🎯 Рекомендуется: говорите на расстоянии 10-30 см от микрофона").small().color(egui::Color32::GRAY));
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
+                        // Модель
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🤖 Модель Whisper").strong().size(16.0));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Путь к модели (ggml-large-v3-turbo.bin):").size(13.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut model_path = self.state.model_path.lock().unwrap();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut *model_path)
+                                    .desired_width(400.0)
+                                    .hint_text("models/ggml-large-v3-turbo.bin")
+                            );
+                            if ui.button("📁 Обзор").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("GGML Model", &["bin"])
+                                    .pick_file()
+                                {
+                                    *model_path = path.to_string_lossy().to_string();
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Скачать: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin").small().color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("⚠️ После смены пути перезапустите приложение").small().color(egui::Color32::YELLOW));
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
+                        // Стоп-слова
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🚫 Стоп-слова (удаляются из текста)").strong().size(16.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Разделяйте запятыми без пробелов: эм,ну,как бы,типа,короче").small().color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut filler = self.state.filler_words.lock().unwrap();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut *filler)
+                                    .desired_width(500.0)
+                                    .desired_rows(6)
+                                    .hint_text("эм,ну,как бы,типа,короче")
+                            );
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
+                        // Замены слов
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🔄 Замена слов при распознавании").strong().size(16.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Формат: слово=замена (каждое с новой строки, # для комментариев)").small().color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut replacements = self.state.word_replacements.lock().unwrap();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut *replacements)
+                                    .desired_width(500.0)
+                                    .desired_rows(10)
+                                    .hint_text("дефис=-\nдвоеточие=:\nточка с запятой=;\nоткрывающая скобка=(\nзакрывающая скобка=)")
+                            );
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Пример: скажете \"дефис\" → вставится \"-\"").small().color(egui::Color32::from_rgb(100, 180, 255)));
+                        });
                     });
-                }
-                AppTab::ApiKey => {
-                    ui.label(egui::RichText::new("Настройка API Ключа (Groq):").strong());
-                    ui.add_space(5.0);
-                    let mut api_key = self.state.api_key.lock().unwrap();
-                    ui.add(egui::TextEdit::singleline(&mut *api_key).password(true).desired_width(f32::INFINITY));
-                }
-                AppTab::FillerWords => {
-                    ui.label(egui::RichText::new("Список слов-паразитов:").strong());
-                    ui.label(egui::RichText::new("(через запятую, без пробелов после запятой)").small().color(egui::Color32::GRAY));
-                    ui.add_space(5.0);
-                    let mut filler = self.state.filler_words.lock().unwrap();
-                    ui.add(egui::TextEdit::multiline(&mut *filler).desired_width(f32::INFINITY));
                 }
             }
         });
@@ -418,39 +773,44 @@ impl eframe::App for VoiceGUI {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("floating_status_widget"),
                 egui::ViewportBuilder::default()
-                    .with_inner_size([190.0, 42.0])
+                    .with_inner_size([220.0, 52.0])
                     .with_always_on_top()
                     .with_decorations(false)
                     .with_transparent(true),
-                |ctx, _class| {
+                move |ctx, _class| {
                     let mut style = (*ctx.style()).clone();
-                    style.visuals.window_fill = egui::Color32::from_black_alpha(220);
+                    style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(28, 28, 30, 245);
+                    style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(32, 32, 36, 245);
+                    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 52);
+                    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 68);
+                    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(70, 130, 180);
+                    style.spacing.item_spacing = egui::vec2(10.0, 6.0);
+                    style.spacing.button_padding = egui::vec2(8.0, 4.0);
                     ctx.set_style(style);
 
-                    let mut close_interacted = false; // Флаг для кнопки закрытия
+                    let mut close_interacted = false;
 
-                    // Сохраняем response от CentralPanel
                     let panel_response = egui::CentralPanel::default().show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.add_space(12.0);
+                            ui.spacing_mut().item_spacing.x = 10.0;
 
                             if is_rec {
-                                ui.label("🔴");
-                                ui.label(egui::RichText::new("Запись...").color(egui::Color32::RED).strong());
+                                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(255, 80, 80)));
+                                ui.label(egui::RichText::new("ЗАПИСЬ").color(egui::Color32::from_rgb(255, 80, 80)).strong().size(13.0).monospace());
                             } else if is_proc {
-                                ui.label("⚙️");
-                                ui.label(egui::RichText::new("Обработка...").color(egui::Color32::YELLOW).strong());
+                                ui.label(egui::RichText::new("⚙").size(16.0).color(egui::Color32::from_rgb(255, 200, 80)));
+                                ui.label(egui::RichText::new("ОБРАБОТКА").color(egui::Color32::from_rgb(255, 200, 80)).strong().size(13.0).monospace());
                             } else {
-                                ui.label("🟢");
-                                ui.label(egui::RichText::new("Готов (F9)").color(egui::Color32::GREEN));
+                                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(80, 255, 120)));
+                                ui.label(egui::RichText::new("ГОТОВ (F9)").color(egui::Color32::from_rgb(80, 255, 120)).size(13.0).monospace());
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let btn = ui.small_button("✖️");
+                                let btn = ui.add_sized([24.0, 24.0], egui::Button::new("✕").frame(false));
                                 if btn.clicked() {
                                     show_widget_clone.store(false, Ordering::Relaxed);
                                 }
-                                // Проверяем, наведена ли мышь или нажата ли кнопка на крестике
                                 if btn.hovered() || btn.is_pointer_button_down_on() {
                                     close_interacted = true;
                                 }
@@ -458,9 +818,8 @@ impl eframe::App for VoiceGUI {
                         });
                     });
 
-                    // Если ЛКМ зажата в любой области виджета (но не на крестике закрытия)
-                    if panel_response.response.is_pointer_button_down_on() && !close_interacted {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); // Начинаем перетаскивание окна
+                    if panel_response.response.dragged() || (panel_response.response.is_pointer_button_down_on() && !close_interacted) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 },
             );
@@ -497,28 +856,23 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     });
 
     thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let client = reqwest::Client::new();
-
             loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                thread::sleep(Duration::from_millis(100));
 
                 if state.is_recording.load(Ordering::SeqCst) {
-                    let audio_bytes = tokio::task::spawn_blocking({
+                    let audio_samples = {
                         let state_clone = state.clone();
-                        move || record_audio_until_stopped(state_clone)
-                    })
-                    .await
-                    .unwrap_or_default();
+                        record_audio_until_stopped(state_clone)
+                    };
 
-                    let api_key = state.api_key.lock().unwrap().clone();
                     let words_raw = state.filler_words.lock().unwrap().clone();
+                    let replacements_raw = state.word_replacements.lock().unwrap().clone();
 
-                    if !audio_bytes.is_empty() && !api_key.is_empty() {
+                    if !audio_samples.is_empty() {
                         let filler_words = parse_filler_words(&words_raw);
+                        let word_replacements = parse_word_replacements(&replacements_raw);
 
-                        match process_audio_pipeline(&client, audio_bytes, &api_key, &filler_words).await {
+                        match process_audio_pipeline(&state, &audio_samples, &filler_words, &word_replacements) {
                             Ok(final_text) => {
                                 if !final_text.is_empty() {
                                     paste_text(&final_text);
@@ -553,7 +907,6 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                 }
             }
         });
-    });
 }
 
 fn main() -> eframe::Result<()> {
