@@ -376,6 +376,54 @@ fn paste_text(text: &str) {
     }
 }
 
+use reqwest::blocking;
+
+const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin";
+
+fn ensure_model_exists(model_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if model_path.exists() {
+        return Ok(());
+    }
+
+    // Create parent directory if needed
+    if let Some(parent) = model_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    eprintln!("Модель не найдена, скачивание с Hugging Face...");
+    eprintln!("URL: {}", MODEL_URL);
+    eprintln!("Куда: {}", model_path.display());
+
+    let client = blocking::Client::new();
+    let mut response = client.get(MODEL_URL).send()?;
+
+    if !response.status().is_success() {
+        return Err(format!("Ошибка скачивания: HTTP {}", response.status()).into());
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut file = std::fs::File::create(model_path)?;
+
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut response, &mut buffer)?;
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        std::io::Write::write_all(&mut file, &buffer[..bytes_read])?;
+        downloaded += bytes_read as u64;
+        if total_size > 0 {
+            let percent = (downloaded as f64 / total_size as f64 * 100.0) as u32;
+            eprint!("\rПрогресс: {}% ({:.1}/{:.1} MB)", percent, downloaded as f64 / 1_048_576.0, total_size as f64 / 1_048_576.0);
+        }
+    }
+    eprintln!("\nМодель скачана успешно!");
+    Ok(())
+}
+
 struct VoiceGUI {
     state: Arc<AppState>,
     active_tab: AppTab,
@@ -389,6 +437,13 @@ impl VoiceGUI {
         dotenvy::dotenv().ok();
         let model_path = std::env::var("WHISPER_MODEL_PATH")
             .unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".to_string());
+        let model_path_buf = std::path::PathBuf::from(&model_path);
+
+        // Download model if missing
+        if let Err(e) = ensure_model_exists(&model_path_buf) {
+            eprintln!("Ошибка скачивания модели: {}", e);
+        }
+
         let filler_words = std::env::var("FILLER_WORDS")
             .unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
         let word_replacements = std::env::var("WORD_REPLACEMENTS")
@@ -413,7 +468,7 @@ impl VoiceGUI {
             filler_words: Mutex::new(filler_words),
             word_replacements: Mutex::new(word_replacements),
             whisper_ctx: Mutex::new(whisper_ctx),
-            mic_gain: Mutex::new(10.0), // Default gain multiplier
+            mic_gain: Mutex::new(10.0),
         });
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
