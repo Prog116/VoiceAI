@@ -28,6 +28,91 @@ struct WordReplacement {
     to: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Hotkey {
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    LeftCtrl, RightCtrl, LeftAlt, RightAlt, LeftShift, RightShift,
+    Space, Enter, Tab, Backspace, Delete, Insert,
+    Home, End, PageUp, PageDown,
+    Up, Down, Left, Right,
+    Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+}
+
+impl Hotkey {
+    pub fn all() -> &'static [Hotkey] {
+        &[
+            Hotkey::F1, Hotkey::F2, Hotkey::F3, Hotkey::F4, Hotkey::F5, Hotkey::F6,
+            Hotkey::F7, Hotkey::F8, Hotkey::F9, Hotkey::F10, Hotkey::F11, Hotkey::F12,
+            Hotkey::LeftCtrl, Hotkey::RightCtrl, Hotkey::LeftAlt, Hotkey::RightAlt,
+            Hotkey::LeftShift, Hotkey::RightShift,
+            Hotkey::Space, Hotkey::Enter, Hotkey::Tab, Hotkey::Backspace, Hotkey::Delete, Hotkey::Insert,
+            Hotkey::Home, Hotkey::End, Hotkey::PageUp, Hotkey::PageDown,
+            Hotkey::Up, Hotkey::Down, Hotkey::Left, Hotkey::Right,
+            Hotkey::Num0, Hotkey::Num1, Hotkey::Num2, Hotkey::Num3, Hotkey::Num4,
+            Hotkey::Num5, Hotkey::Num6, Hotkey::Num7, Hotkey::Num8, Hotkey::Num9,
+            Hotkey::A, Hotkey::B, Hotkey::C, Hotkey::D, Hotkey::E, Hotkey::F, Hotkey::G,
+            Hotkey::H, Hotkey::I, Hotkey::J, Hotkey::K, Hotkey::L, Hotkey::M, Hotkey::N,
+            Hotkey::O, Hotkey::P, Hotkey::Q, Hotkey::R, Hotkey::S, Hotkey::T, Hotkey::U,
+            Hotkey::V, Hotkey::W, Hotkey::X, Hotkey::Y, Hotkey::Z,
+        ]
+    }
+
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            Hotkey::F1 => "F1", Hotkey::F2 => "F2", Hotkey::F3 => "F3", Hotkey::F4 => "F4",
+            Hotkey::F5 => "F5", Hotkey::F6 => "F6", Hotkey::F7 => "F7", Hotkey::F8 => "F8",
+            Hotkey::F9 => "F9", Hotkey::F10 => "F10", Hotkey::F11 => "F11", Hotkey::F12 => "F12",
+            Hotkey::LeftCtrl => "L_Ctrl", Hotkey::RightCtrl => "R_Ctrl",
+            Hotkey::LeftAlt => "L_Alt", Hotkey::RightAlt => "R_Alt",
+            Hotkey::LeftShift => "L_Shift", Hotkey::RightShift => "R_Shift",
+            Hotkey::Space => "Space", Hotkey::Enter => "Enter", Hotkey::Tab => "Tab",
+            Hotkey::Backspace => "Backspace", Hotkey::Delete => "Del", Hotkey::Insert => "Ins",
+            Hotkey::Home => "Home", Hotkey::End => "End", Hotkey::PageUp => "PgUp", Hotkey::PageDown => "PgDn",
+            Hotkey::Up => "Up", Hotkey::Down => "Down", Hotkey::Left => "Left", Hotkey::Right => "Right",
+            Hotkey::Num0 => "0", Hotkey::Num1 => "1", Hotkey::Num2 => "2", Hotkey::Num3 => "3",
+            Hotkey::Num4 => "4", Hotkey::Num5 => "5", Hotkey::Num6 => "6", Hotkey::Num7 => "7",
+            Hotkey::Num8 => "8", Hotkey::Num9 => "9",
+            Hotkey::A => "A", Hotkey::B => "B", Hotkey::C => "C", Hotkey::D => "D",
+            Hotkey::E => "E", Hotkey::F => "F", Hotkey::G => "G", Hotkey::H => "H",
+            Hotkey::I => "I", Hotkey::J => "J", Hotkey::K => "K", Hotkey::L => "L",
+            Hotkey::M => "M", Hotkey::N => "N", Hotkey::O => "O", Hotkey::P => "P",
+            Hotkey::Q => "Q", Hotkey::R => "R", Hotkey::S => "S", Hotkey::T => "T",
+            Hotkey::U => "U", Hotkey::V => "V", Hotkey::W => "W", Hotkey::X => "X",
+            Hotkey::Y => "Y", Hotkey::Z => "Z",
+        }
+    }
+
+    pub fn to_rdev_key(&self) -> Option<Key> {
+        match self {
+            Hotkey::F1 => Some(Key::F1), Hotkey::F2 => Some(Key::F2), Hotkey::F3 => Some(Key::F3),
+            Hotkey::F4 => Some(Key::F4), Hotkey::F5 => Some(Key::F5), Hotkey::F6 => Some(Key::F6),
+            Hotkey::F7 => Some(Key::F7), Hotkey::F8 => Some(Key::F8), Hotkey::F9 => Some(Key::F9),
+            Hotkey::F10 => Some(Key::F10), Hotkey::F11 => Some(Key::F11), Hotkey::F12 => Some(Key::F12),
+            Hotkey::LeftCtrl => Some(Key::ControlLeft), Hotkey::RightCtrl => Some(Key::ControlRight),
+            Hotkey::LeftAlt => Some(Key::Alt), Hotkey::RightAlt => Some(Key::AltGr),
+            Hotkey::LeftShift => Some(Key::ShiftLeft), Hotkey::RightShift => Some(Key::ShiftRight),
+            Hotkey::Space => Some(Key::Space), Hotkey::Enter => Some(Key::Return), Hotkey::Tab => Some(Key::Tab),
+            Hotkey::Backspace => Some(Key::Backspace), Hotkey::Delete => Some(Key::Delete), Hotkey::Insert => Some(Key::Insert),
+            Hotkey::Home => Some(Key::Home), Hotkey::End => Some(Key::End), Hotkey::PageUp => Some(Key::PageUp), Hotkey::PageDown => Some(Key::PageDown),
+            Hotkey::Up => Some(Key::UpArrow), Hotkey::Down => Some(Key::DownArrow), Hotkey::Left => Some(Key::LeftArrow), Hotkey::Right => Some(Key::RightArrow),
+            Hotkey::Num0 => Some(Key::Num0), Hotkey::Num1 => Some(Key::Num1), Hotkey::Num2 => Some(Key::Num2),
+            Hotkey::Num3 => Some(Key::Num3), Hotkey::Num4 => Some(Key::Num4), Hotkey::Num5 => Some(Key::Num5),
+            Hotkey::Num6 => Some(Key::Num6), Hotkey::Num7 => Some(Key::Num7), Hotkey::Num8 => Some(Key::Num8),
+            Hotkey::Num9 => Some(Key::Num9),
+            Hotkey::A => Some(Key::KeyA), Hotkey::B => Some(Key::KeyB), Hotkey::C => Some(Key::KeyC),
+            Hotkey::D => Some(Key::KeyD), Hotkey::E => Some(Key::KeyE), Hotkey::F => Some(Key::KeyF),
+            Hotkey::G => Some(Key::KeyG), Hotkey::H => Some(Key::KeyH), Hotkey::I => Some(Key::KeyI),
+            Hotkey::J => Some(Key::KeyJ), Hotkey::K => Some(Key::KeyK), Hotkey::L => Some(Key::KeyL),
+            Hotkey::M => Some(Key::KeyM), Hotkey::N => Some(Key::KeyN), Hotkey::O => Some(Key::KeyO),
+            Hotkey::P => Some(Key::KeyP), Hotkey::Q => Some(Key::KeyQ), Hotkey::R => Some(Key::KeyR),
+            Hotkey::S => Some(Key::KeyS), Hotkey::T => Some(Key::KeyT), Hotkey::U => Some(Key::KeyU),
+            Hotkey::V => Some(Key::KeyV), Hotkey::W => Some(Key::KeyW), Hotkey::X => Some(Key::KeyX),
+            Hotkey::Y => Some(Key::KeyY), Hotkey::Z => Some(Key::KeyZ),
+        }
+    }
+}
+
 fn parse_word_replacements(raw: &str) -> Vec<WordReplacement> {
     raw.lines()
         .filter_map(|line| {
@@ -120,6 +205,8 @@ struct AppState {
     pub word_replacements: Mutex<String>,
     pub whisper_ctx: Mutex<Option<WhisperContext>>,
     pub mic_gain: Mutex<f32>,
+    pub hotkey_record: Mutex<Hotkey>,
+    pub hotkey_exit: Mutex<Hotkey>,
 }
 
 #[derive(PartialEq)]
@@ -469,6 +556,8 @@ impl VoiceGUI {
             word_replacements: Mutex::new(word_replacements),
             whisper_ctx: Mutex::new(whisper_ctx),
             mic_gain: Mutex::new(10.0),
+            hotkey_record: Mutex::new(Hotkey::F9),
+            hotkey_exit: Mutex::new(Hotkey::F12),
         });
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
@@ -719,6 +808,55 @@ impl eframe::App for VoiceGUI {
                         ui.separator();
                         ui.add_space(15.0);
 
+                        // Горячие клавиши
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("⌨ Горячие клавиши").strong().size(16.0));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Клавиша записи (зажать):").size(13.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut record_hk = self.state.hotkey_record.lock().unwrap();
+                            egui::ComboBox::from_id_source("record_hotkey")
+                                .selected_text(record_hk.to_string())
+                                .show_ui(ui, |ui| {
+                                    for hk in Hotkey::all() {
+                                        ui.selectable_value(&mut *record_hk, *hk, hk.to_string());
+                                    }
+                                });
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Клавиша выхода:").size(13.0));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let mut exit_hk = self.state.hotkey_exit.lock().unwrap();
+                            egui::ComboBox::from_id_source("exit_hotkey")
+                                .selected_text(exit_hk.to_string())
+                                .show_ui(ui, |ui| {
+                                    for hk in Hotkey::all() {
+                                        ui.selectable_value(&mut *exit_hk, *hk, hk.to_string());
+                                    }
+                                });
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("⚠️ Изменения вступят в силу после перезапуска").small().color(egui::Color32::YELLOW));
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
                         // Модель
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
@@ -885,23 +1023,27 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     let state_for_keys = state.clone();
     let ctx_for_keys = ctx.clone();
 
+    // Get the configured hotkeys
+    let record_key = state_for_keys.hotkey_record.lock().unwrap().to_rdev_key().unwrap_or(Key::F9);
+    let exit_key = state_for_keys.hotkey_exit.lock().unwrap().to_rdev_key().unwrap_or(Key::F12);
+
     thread::spawn(move || {
         if let Err(e) = rdev::listen(move |event| match event.event_type {
-            EventType::KeyPress(Key::F9) => {
+            EventType::KeyPress(k) if k == record_key => {
                 if !state_for_keys.is_recording.load(Ordering::SeqCst) {
                     state_for_keys.is_recording.store(true, Ordering::SeqCst);
                     *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
                     ctx_for_keys.request_repaint();
                 }
             }
-            EventType::KeyRelease(Key::F9) => {
+            EventType::KeyRelease(k) if k == record_key => {
                 if state_for_keys.is_recording.load(Ordering::SeqCst) {
                     state_for_keys.is_recording.store(false, Ordering::SeqCst);
                     *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
                     ctx_for_keys.request_repaint();
                 }
             }
-            EventType::KeyPress(Key::F12) => {
+            EventType::KeyPress(k) if k == exit_key => {
                 std::process::exit(0);
             }
             _ => {}
