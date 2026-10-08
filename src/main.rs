@@ -113,6 +113,96 @@ impl Hotkey {
     }
 }
 
+fn egui_key_to_hotkey(key: egui::Key) -> Option<Hotkey> {
+    match key {
+        egui::Key::F1 => Some(Hotkey::F1), egui::Key::F2 => Some(Hotkey::F2),
+        egui::Key::F3 => Some(Hotkey::F3), egui::Key::F4 => Some(Hotkey::F4),
+        egui::Key::F5 => Some(Hotkey::F5), egui::Key::F6 => Some(Hotkey::F6),
+        egui::Key::F7 => Some(Hotkey::F7), egui::Key::F8 => Some(Hotkey::F8),
+        egui::Key::F9 => Some(Hotkey::F9), egui::Key::F10 => Some(Hotkey::F10),
+        egui::Key::F11 => Some(Hotkey::F11), egui::Key::F12 => Some(Hotkey::F12),
+        egui::Key::Space => Some(Hotkey::Space),
+        egui::Key::Enter => Some(Hotkey::Enter),
+        egui::Key::Tab => Some(Hotkey::Tab),
+        egui::Key::Backspace => Some(Hotkey::Backspace),
+        egui::Key::Delete => Some(Hotkey::Delete),
+        egui::Key::Insert => Some(Hotkey::Insert),
+        egui::Key::Home => Some(Hotkey::Home),
+        egui::Key::End => Some(Hotkey::End),
+        egui::Key::PageUp => Some(Hotkey::PageUp),
+        egui::Key::PageDown => Some(Hotkey::PageDown),
+        egui::Key::ArrowUp => Some(Hotkey::Up),
+        egui::Key::ArrowDown => Some(Hotkey::Down),
+        egui::Key::ArrowLeft => Some(Hotkey::Left),
+        egui::Key::ArrowRight => Some(Hotkey::Right),
+        egui::Key::Num0 => Some(Hotkey::Num0), egui::Key::Num1 => Some(Hotkey::Num1),
+        egui::Key::Num2 => Some(Hotkey::Num2), egui::Key::Num3 => Some(Hotkey::Num3),
+        egui::Key::Num4 => Some(Hotkey::Num4), egui::Key::Num5 => Some(Hotkey::Num5),
+        egui::Key::Num6 => Some(Hotkey::Num6), egui::Key::Num7 => Some(Hotkey::Num7),
+        egui::Key::Num8 => Some(Hotkey::Num8), egui::Key::Num9 => Some(Hotkey::Num9),
+        egui::Key::A => Some(Hotkey::A), egui::Key::B => Some(Hotkey::B),
+        egui::Key::C => Some(Hotkey::C), egui::Key::D => Some(Hotkey::D),
+        egui::Key::E => Some(Hotkey::E), egui::Key::F => Some(Hotkey::F),
+        egui::Key::G => Some(Hotkey::G), egui::Key::H => Some(Hotkey::H),
+        egui::Key::I => Some(Hotkey::I), egui::Key::J => Some(Hotkey::J),
+        egui::Key::K => Some(Hotkey::K), egui::Key::L => Some(Hotkey::L),
+        egui::Key::M => Some(Hotkey::M), egui::Key::N => Some(Hotkey::N),
+        egui::Key::O => Some(Hotkey::O), egui::Key::P => Some(Hotkey::P),
+        egui::Key::Q => Some(Hotkey::Q), egui::Key::R => Some(Hotkey::R),
+        egui::Key::S => Some(Hotkey::S), egui::Key::T => Some(Hotkey::T),
+        egui::Key::U => Some(Hotkey::U), egui::Key::V => Some(Hotkey::V),
+        egui::Key::W => Some(Hotkey::W), egui::Key::X => Some(Hotkey::X),
+        egui::Key::Y => Some(Hotkey::Y), egui::Key::Z => Some(Hotkey::Z),
+        _ => None,
+    }
+}
+
+fn hotkey_from_string(s: &str) -> Hotkey {
+    match s.trim().to_uppercase().as_str() {
+        "F1" => Hotkey::F1, "F2" => Hotkey::F2, "F3" => Hotkey::F3, "F4" => Hotkey::F4,
+        "F5" => Hotkey::F5, "F6" => Hotkey::F6, "F7" => Hotkey::F7, "F8" => Hotkey::F8,
+        "F9" => Hotkey::F9, "F10" => Hotkey::F10, "F11" => Hotkey::F11, "F12" => Hotkey::F12,
+        "L_CTRL" | "LCONTROL" | "LEFTCTRL" => Hotkey::LeftCtrl,
+        "R_CTRL" | "RCONTROL" | "RIGHTCTRL" => Hotkey::RightCtrl,
+        "L_ALT" | "LALT" | "LEFTALT" => Hotkey::LeftAlt,
+        "R_ALT" | "RALT" | "RIGHTALT" | "ALTGR" => Hotkey::RightAlt,
+        "L_SHIFT" | "LSHIFT" | "LEFTSHIFT" => Hotkey::LeftShift,
+        "R_SHIFT" | "RSHIFT" | "RIGHTSHIFT" => Hotkey::RightShift,
+        "SPACE" => Hotkey::Space,
+        "ENTER" | "RETURN" => Hotkey::Enter,
+        "TAB" => Hotkey::Tab,
+        "BACKSPACE" => Hotkey::Backspace,
+        "DELETE" | "DEL" => Hotkey::Delete,
+        "INSERT" | "INS" => Hotkey::Insert,
+        "HOME" => Hotkey::Home,
+        "END" => Hotkey::End,
+        "PAGEUP" | "PGUP" => Hotkey::PageUp,
+        "PAGEDOWN" | "PGDN" => Hotkey::PageDown,
+        "UP" | "ARROWUP" => Hotkey::Up,
+        "DOWN" | "ARROWDOWN" => Hotkey::Down,
+        "LEFT" | "ARROWLEFT" => Hotkey::Left,
+        "RIGHT" | "ARROWRIGHT" => Hotkey::Right,
+        "0" | "NUM0" => Hotkey::Num0,
+        "1" | "NUM1" => Hotkey::Num1,
+        "2" | "NUM2" => Hotkey::Num2,
+        "3" | "NUM3" => Hotkey::Num3,
+        "4" | "NUM4" => Hotkey::Num4,
+        "5" | "NUM5" => Hotkey::Num5,
+        "6" | "NUM6" => Hotkey::Num6,
+        "7" | "NUM7" => Hotkey::Num7,
+        "8" | "NUM8" => Hotkey::Num8,
+        "9" | "NUM9" => Hotkey::Num9,
+        "A" => Hotkey::A, "B" => Hotkey::B, "C" => Hotkey::C, "D" => Hotkey::D,
+        "E" => Hotkey::E, "F" => Hotkey::F, "G" => Hotkey::G, "H" => Hotkey::H,
+        "I" => Hotkey::I, "J" => Hotkey::J, "K" => Hotkey::K, "L" => Hotkey::L,
+        "M" => Hotkey::M, "N" => Hotkey::N, "O" => Hotkey::O, "P" => Hotkey::P,
+        "Q" => Hotkey::Q, "R" => Hotkey::R, "S" => Hotkey::S, "T" => Hotkey::T,
+        "U" => Hotkey::U, "V" => Hotkey::V, "W" => Hotkey::W, "X" => Hotkey::X,
+        "Y" => Hotkey::Y, "Z" => Hotkey::Z,
+        _ => Hotkey::F9,
+    }
+}
+
 fn parse_word_replacements(raw: &str) -> Vec<WordReplacement> {
     raw.lines()
         .filter_map(|line| {
@@ -511,12 +601,16 @@ fn ensure_model_exists(model_path: &std::path::Path) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum HotkeyAction { Record, Exit }
+
 struct VoiceGUI {
     state: Arc<AppState>,
     active_tab: AppTab,
     show_widget: Arc<AtomicBool>,
     search_query: String,
     dark_mode: bool,
+    waiting_for_hotkey: Option<HotkeyAction>,
 }
 
 impl VoiceGUI {
@@ -547,6 +641,14 @@ impl VoiceGUI {
             println!("Модель загружена успешно: {}", model_path);
         }
 
+        // Load hotkeys from .env
+        let record_hotkey = std::env::var("HOTKEY_RECORD")
+            .map(|s| hotkey_from_string(&s))
+            .unwrap_or(Hotkey::F9);
+        let exit_hotkey = std::env::var("HOTKEY_EXIT")
+            .map(|s| hotkey_from_string(&s))
+            .unwrap_or(Hotkey::F12);
+
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
             status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
@@ -556,8 +658,8 @@ impl VoiceGUI {
             word_replacements: Mutex::new(word_replacements),
             whisper_ctx: Mutex::new(whisper_ctx),
             mic_gain: Mutex::new(10.0),
-            hotkey_record: Mutex::new(Hotkey::F9),
-            hotkey_exit: Mutex::new(Hotkey::F12),
+            hotkey_record: Mutex::new(record_hotkey),
+            hotkey_exit: Mutex::new(exit_hotkey),
         });
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
@@ -569,7 +671,33 @@ impl VoiceGUI {
             show_widget: Arc::new(AtomicBool::new(false)),
             search_query: String::new(),
             dark_mode: true,
+            waiting_for_hotkey: None,
         }
+    }
+}
+
+impl VoiceGUI {
+    fn save_hotkey_to_env(&self, key_name: &str, hotkey: Hotkey) {
+        let env_path = std::path::Path::new(".env");
+        let key_str = hotkey.to_string();
+        
+        let mut lines: Vec<String> = if env_path.exists() {
+            std::fs::read_to_string(env_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        
+        // Remove existing key if present
+        lines.retain(|line| !line.starts_with(&format!("{}=", key_name)));
+        
+        // Add new key
+        lines.push(format!("{}={}", key_name, key_str));
+        
+        let _ = std::fs::write(env_path, lines.join("\n"));
     }
 }
 
@@ -606,9 +734,38 @@ impl eframe::App for VoiceGUI {
             egui::TextStyle::Body,
             egui::FontId::new(14.0, egui::FontFamily::Proportional),
         );
-        ctx.set_style(style);
+ctx.set_style(style);
 
-        // Применяем тему
+        // Handle hotkey capture
+        if let Some(action) = self.waiting_for_hotkey {
+            ctx.input(|i| {
+                for event in &i.events {
+                    if let egui::Event::Key { key, pressed: true, .. } = event {
+                        if *key == egui::Key::Escape {
+                            self.waiting_for_hotkey = None;
+                            return;
+                        }
+                        if let Some(hk) = egui_key_to_hotkey(*key) {
+                            match action {
+                                HotkeyAction::Record => {
+                                    *self.state.hotkey_record.lock().unwrap() = hk;
+                                    self.save_hotkey_to_env("HOTKEY_RECORD", hk);
+                                }
+                                HotkeyAction::Exit => {
+                                    *self.state.hotkey_exit.lock().unwrap() = hk;
+                                    self.save_hotkey_to_env("HOTKEY_EXIT", hk);
+                                }
+                            }
+                            self.waiting_for_hotkey = None;
+                            return;
+                        }
+                    }
+                }
+            });
+            ctx.request_repaint();
+        }
+
+        // Применяем тема
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
@@ -645,8 +802,10 @@ impl eframe::App for VoiceGUI {
 
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("Горячие клавиши:").size(11.0).color(egui::Color32::GRAY));
-                    ui.label(egui::RichText::new("F9 — Запись (зажмите)").size(11.0).color(egui::Color32::GRAY));
-                    ui.label(egui::RichText::new("F12 — Выход").size(11.0).color(egui::Color32::GRAY));
+                    let record_hk = *self.state.hotkey_record.lock().unwrap();
+                    let exit_hk = *self.state.hotkey_exit.lock().unwrap();
+                    ui.label(egui::RichText::new(format!("{} — Запись (зажмите)", record_hk.to_string())).size(11.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new(format!("{} — Выход", exit_hk.to_string())).size(11.0).color(egui::Color32::GRAY));
                 });
             });
 
@@ -821,14 +980,20 @@ impl eframe::App for VoiceGUI {
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let mut record_hk = self.state.hotkey_record.lock().unwrap();
-                            egui::ComboBox::from_id_source("record_hotkey")
-                                .selected_text(record_hk.to_string())
-                                .show_ui(ui, |ui| {
-                                    for hk in Hotkey::all() {
-                                        ui.selectable_value(&mut *record_hk, *hk, hk.to_string());
-                                    }
-                                });
+                            let record_hk = *self.state.hotkey_record.lock().unwrap();
+                            
+                            ui.label(egui::RichText::new(format!("Текущая: {}", record_hk.to_string())).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
+                            ui.add_space(10.0);
+                            
+                            let waiting_record = matches!(self.waiting_for_hotkey, Some(HotkeyAction::Record));
+                            let btn_text = if waiting_record { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить клавишу" };
+                            let btn = ui.add_enabled(!waiting_record, egui::Button::new(btn_text)
+                                .fill(if waiting_record { egui::Color32::YELLOW } else { egui::Color32::from_rgb(70, 130, 180) })
+                                .min_size(egui::vec2(200.0, 30.0)));
+                            
+                            if btn.clicked() {
+                                self.waiting_for_hotkey = Some(HotkeyAction::Record);
+                            }
                         });
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
@@ -838,14 +1003,20 @@ impl eframe::App for VoiceGUI {
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let mut exit_hk = self.state.hotkey_exit.lock().unwrap();
-                            egui::ComboBox::from_id_source("exit_hotkey")
-                                .selected_text(exit_hk.to_string())
-                                .show_ui(ui, |ui| {
-                                    for hk in Hotkey::all() {
-                                        ui.selectable_value(&mut *exit_hk, *hk, hk.to_string());
-                                    }
-                                });
+                            let exit_hk = *self.state.hotkey_exit.lock().unwrap();
+                            
+                            ui.label(egui::RichText::new(format!("Текущая: {}", exit_hk.to_string())).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
+                            ui.add_space(10.0);
+                            
+                            let waiting_exit = matches!(self.waiting_for_hotkey, Some(HotkeyAction::Exit));
+                            let btn_text = if waiting_exit { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить клавишу" };
+                            let btn = ui.add_enabled(!waiting_exit, egui::Button::new(btn_text)
+                                .fill(if waiting_exit { egui::Color32::YELLOW } else { egui::Color32::from_rgb(70, 130, 180) })
+                                .min_size(egui::vec2(200.0, 30.0)));
+                            
+                            if btn.clicked() {
+                                self.waiting_for_hotkey = Some(HotkeyAction::Exit);
+                            }
                         });
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
