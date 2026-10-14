@@ -828,28 +828,53 @@ impl VoiceGUI {
     }
 }
 
+fn encode_env_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn upsert_env_line(key: &str, value: &str) {
+    let env_path = std::path::Path::new(".env");
+    let mut lines: Vec<String> = if env_path.exists() {
+        std::fs::read_to_string(env_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let prefix = format!("{}=", key);
+    lines.retain(|line| !line.starts_with(&prefix));
+    lines.push(format!("{}={}", key, encode_env_value(value)));
+    let _ = std::fs::write(env_path, lines.join("\n"));
+}
+
 impl VoiceGUI {
     fn save_hotkey_to_env(&self, key_name: &str, binding: &HotkeyBinding) {
-        let env_path = std::path::Path::new(".env");
-        let key_str = binding.to_string();
-        
-        let mut lines: Vec<String> = if env_path.exists() {
-            std::fs::read_to_string(env_path)
-                .unwrap_or_default()
-                .lines()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        
-        // Remove existing key if present
-        lines.retain(|line| !line.starts_with(&format!("{}=", key_name)));
-        
-        // Add new key
-        lines.push(format!("{}={}", key_name, key_str));
-        
-        let _ = std::fs::write(env_path, lines.join("\n"));
+        upsert_env_line(key_name, &binding.to_string());
+    }
+
+    fn save_filler_words(&self) {
+        let value = self.state.filler_words.lock().unwrap().clone();
+        upsert_env_line("FILLER_WORDS", &value);
+    }
+
+    fn save_word_replacements(&self) {
+        let value = self.state.word_replacements.lock().unwrap().clone();
+        upsert_env_line("WORD_REPLACEMENTS", &value);
     }
 }
 
@@ -1312,13 +1337,23 @@ ctx.set_style(style);
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let mut filler = self.state.filler_words.lock().unwrap();
-                            ui.add(
-                                egui::TextEdit::multiline(&mut *filler)
-                                    .desired_width(500.0)
-                                    .desired_rows(6)
-                                    .hint_text("эм,ну,как бы,типа,короче")
-                            );
+                            let resp = {
+                                let mut filler = self.state.filler_words.lock().unwrap();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut *filler)
+                                        .desired_width(500.0)
+                                        .desired_rows(6)
+                                        .hint_text("эм,ну,как бы,типа,короче")
+                                )
+                            };
+                            if resp.changed() {
+                                self.save_filler_words();
+                            }
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("💾 Сохраняется автоматически").small().color(egui::Color32::GRAY));
                         });
 
                         ui.add_space(20.0);
@@ -1338,18 +1373,28 @@ ctx.set_style(style);
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let mut replacements = self.state.word_replacements.lock().unwrap();
-                            ui.add(
-                                egui::TextEdit::multiline(&mut *replacements)
-                                    .desired_width(500.0)
-                                    .desired_rows(10)
-                                    .hint_text("дефис=-\nдвоеточие=:\nточка с запятой=;\nоткрывающая скобка=(\nзакрывающая скобка=)")
-                            );
+                            let resp = {
+                                let mut replacements = self.state.word_replacements.lock().unwrap();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut *replacements)
+                                        .desired_width(500.0)
+                                        .desired_rows(10)
+                                        .hint_text("дефис=-\nдвоеточие=:\nточка с запятой=;\nоткрывающая скобка=(\nзакрывающая скобка=)")
+                                )
+                            };
+                            if resp.changed() {
+                                self.save_word_replacements();
+                            }
                         });
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("Пример: скажете \"дефис\" → вставится \"-\"").small().color(egui::Color32::from_rgb(100, 180, 255)));
+                        });
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("💾 Сохраняется автоматически").small().color(egui::Color32::GRAY));
                         });
                     });
                 }
@@ -1590,5 +1635,41 @@ mod tests {
     fn empty_filler_words_string_gives_empty_list() {
         let result = parse_filler_words("");
         assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn encode_env_value_quotes_plain() {
+        assert_eq!(encode_env_value("F9"), "\"F9\"");
+    }
+
+    #[test]
+    fn encode_env_value_escapes_newline() {
+        assert_eq!(encode_env_value("a=b\nc=d"), "\"a=b\\nc=d\"");
+    }
+
+    #[test]
+    fn encode_env_value_escapes_dollar_and_quotes() {
+        assert_eq!(encode_env_value("a$b\"c"), "\"a\\$b\\\"c\"");
+    }
+
+    #[test]
+    fn encode_env_value_drops_carriage_return() {
+        assert_eq!(encode_env_value("a\r\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn env_values_survive_dotenvy_roundtrip() {
+        let filler = "эм,ну,как бы";
+        let repl = "дефис=-\nдвоеточие=:$";
+        let content = format!(
+            "FILLER_WORDS={}\nWORD_REPLACEMENTS={}\n",
+            encode_env_value(filler),
+            encode_env_value(repl)
+        );
+        let parsed: Vec<(String, String)> = dotenvy::from_read_iter(content.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(parsed.contains(&("FILLER_WORDS".to_string(), filler.to_string())));
+        assert!(parsed.contains(&("WORD_REPLACEMENTS".to_string(), repl.to_string())));
     }
 }
