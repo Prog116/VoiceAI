@@ -15,6 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[link(name = "user32")]
+extern "system" {
+    fn GetAsyncKeyState(vkey: i32) -> i16;
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct HistoryEntry {
     text: String,
@@ -109,6 +114,31 @@ impl Hotkey {
             Hotkey::S => Some(Key::KeyS), Hotkey::T => Some(Key::KeyT), Hotkey::U => Some(Key::KeyU),
             Hotkey::V => Some(Key::KeyV), Hotkey::W => Some(Key::KeyW), Hotkey::X => Some(Key::KeyX),
             Hotkey::Y => Some(Key::KeyY), Hotkey::Z => Some(Key::KeyZ),
+        }
+    }
+
+    pub fn to_vk(&self) -> i32 {
+        match self {
+            Hotkey::F1 => 0x70, Hotkey::F2 => 0x71, Hotkey::F3 => 0x72, Hotkey::F4 => 0x73,
+            Hotkey::F5 => 0x74, Hotkey::F6 => 0x75, Hotkey::F7 => 0x76, Hotkey::F8 => 0x77,
+            Hotkey::F9 => 0x78, Hotkey::F10 => 0x79, Hotkey::F11 => 0x7A, Hotkey::F12 => 0x7B,
+            Hotkey::LeftCtrl => 0xA2, Hotkey::RightCtrl => 0xA3,
+            Hotkey::LeftAlt => 0xA4, Hotkey::RightAlt => 0xA5,
+            Hotkey::LeftShift => 0xA0, Hotkey::RightShift => 0xA1,
+            Hotkey::Space => 0x20, Hotkey::Enter => 0x0D, Hotkey::Tab => 0x09,
+            Hotkey::Backspace => 0x08, Hotkey::Delete => 0x2E, Hotkey::Insert => 0x2D,
+            Hotkey::Home => 0x24, Hotkey::End => 0x23, Hotkey::PageUp => 0x21, Hotkey::PageDown => 0x22,
+            Hotkey::Up => 0x26, Hotkey::Down => 0x28, Hotkey::Left => 0x25, Hotkey::Right => 0x27,
+            Hotkey::Num0 => 0x30, Hotkey::Num1 => 0x31, Hotkey::Num2 => 0x32, Hotkey::Num3 => 0x33,
+            Hotkey::Num4 => 0x34, Hotkey::Num5 => 0x35, Hotkey::Num6 => 0x36, Hotkey::Num7 => 0x37,
+            Hotkey::Num8 => 0x38, Hotkey::Num9 => 0x39,
+            Hotkey::A => 0x41, Hotkey::B => 0x42, Hotkey::C => 0x43, Hotkey::D => 0x44,
+            Hotkey::E => 0x45, Hotkey::F => 0x46, Hotkey::G => 0x47, Hotkey::H => 0x48,
+            Hotkey::I => 0x49, Hotkey::J => 0x4A, Hotkey::K => 0x4B, Hotkey::L => 0x4C,
+            Hotkey::M => 0x4D, Hotkey::N => 0x4E, Hotkey::O => 0x4F, Hotkey::P => 0x50,
+            Hotkey::Q => 0x51, Hotkey::R => 0x52, Hotkey::S => 0x53, Hotkey::T => 0x54,
+            Hotkey::U => 0x55, Hotkey::V => 0x56, Hotkey::W => 0x57, Hotkey::X => 0x58,
+            Hotkey::Y => 0x59, Hotkey::Z => 0x5A,
         }
     }
 }
@@ -1194,32 +1224,40 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     let state_for_keys = state.clone();
     let ctx_for_keys = ctx.clone();
 
-    // Get the configured hotkeys
-    let record_key = state_for_keys.hotkey_record.lock().unwrap().to_rdev_key().unwrap_or(Key::F9);
-    let exit_key = state_for_keys.hotkey_exit.lock().unwrap().to_rdev_key().unwrap_or(Key::F12);
+    // Отслеживаем горячие клавиши через прямой опрос состояния клавиш.
+    // Это надёжнее низкоуровневого хука: опрос не зависит от активного окна
+    // и его не перехватывают сторонние хуки (драйверы GPU и т.п.).
+    let record_vk = state_for_keys.hotkey_record.lock().unwrap().to_vk();
+    let exit_vk = state_for_keys.hotkey_exit.lock().unwrap().to_vk();
 
     thread::spawn(move || {
-        if let Err(e) = rdev::listen(move |event| match event.event_type {
-            EventType::KeyPress(k) if k == record_key => {
-                if !state_for_keys.is_recording.load(Ordering::SeqCst) {
-                    state_for_keys.is_recording.store(true, Ordering::SeqCst);
-                    *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
-                    ctx_for_keys.request_repaint();
-                }
+        let mut prev_record_down = false;
+        let mut prev_exit_down = false;
+
+        loop {
+            thread::sleep(Duration::from_millis(15));
+
+            let record_down = (unsafe { GetAsyncKeyState(record_vk) } as u16 & 0x8000) != 0;
+            let exit_down = (unsafe { GetAsyncKeyState(exit_vk) } as u16 & 0x8000) != 0;
+
+            if record_down && !prev_record_down && !state_for_keys.is_recording.load(Ordering::SeqCst) {
+                state_for_keys.is_recording.store(true, Ordering::SeqCst);
+                *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
+                ctx_for_keys.request_repaint();
             }
-            EventType::KeyRelease(k) if k == record_key => {
-                if state_for_keys.is_recording.load(Ordering::SeqCst) {
-                    state_for_keys.is_recording.store(false, Ordering::SeqCst);
-                    *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
-                    ctx_for_keys.request_repaint();
-                }
+
+            if !record_down && prev_record_down && state_for_keys.is_recording.load(Ordering::SeqCst) {
+                state_for_keys.is_recording.store(false, Ordering::SeqCst);
+                *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
+                ctx_for_keys.request_repaint();
             }
-            EventType::KeyPress(k) if k == exit_key => {
+
+            if exit_down && !prev_exit_down {
                 std::process::exit(0);
             }
-            _ => {}
-        }) {
-            eprintln!("Ошибка слушателя клавиатуры: {:?}", e);
+
+            prev_record_down = record_down;
+            prev_exit_down = exit_down;
         }
     });
 
