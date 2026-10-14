@@ -88,35 +88,6 @@ impl Hotkey {
         }
     }
 
-    pub fn to_rdev_key(&self) -> Option<Key> {
-        match self {
-            Hotkey::F1 => Some(Key::F1), Hotkey::F2 => Some(Key::F2), Hotkey::F3 => Some(Key::F3),
-            Hotkey::F4 => Some(Key::F4), Hotkey::F5 => Some(Key::F5), Hotkey::F6 => Some(Key::F6),
-            Hotkey::F7 => Some(Key::F7), Hotkey::F8 => Some(Key::F8), Hotkey::F9 => Some(Key::F9),
-            Hotkey::F10 => Some(Key::F10), Hotkey::F11 => Some(Key::F11), Hotkey::F12 => Some(Key::F12),
-            Hotkey::LeftCtrl => Some(Key::ControlLeft), Hotkey::RightCtrl => Some(Key::ControlRight),
-            Hotkey::LeftAlt => Some(Key::Alt), Hotkey::RightAlt => Some(Key::AltGr),
-            Hotkey::LeftShift => Some(Key::ShiftLeft), Hotkey::RightShift => Some(Key::ShiftRight),
-            Hotkey::Space => Some(Key::Space), Hotkey::Enter => Some(Key::Return), Hotkey::Tab => Some(Key::Tab),
-            Hotkey::Backspace => Some(Key::Backspace), Hotkey::Delete => Some(Key::Delete), Hotkey::Insert => Some(Key::Insert),
-            Hotkey::Home => Some(Key::Home), Hotkey::End => Some(Key::End), Hotkey::PageUp => Some(Key::PageUp), Hotkey::PageDown => Some(Key::PageDown),
-            Hotkey::Up => Some(Key::UpArrow), Hotkey::Down => Some(Key::DownArrow), Hotkey::Left => Some(Key::LeftArrow), Hotkey::Right => Some(Key::RightArrow),
-            Hotkey::Num0 => Some(Key::Num0), Hotkey::Num1 => Some(Key::Num1), Hotkey::Num2 => Some(Key::Num2),
-            Hotkey::Num3 => Some(Key::Num3), Hotkey::Num4 => Some(Key::Num4), Hotkey::Num5 => Some(Key::Num5),
-            Hotkey::Num6 => Some(Key::Num6), Hotkey::Num7 => Some(Key::Num7), Hotkey::Num8 => Some(Key::Num8),
-            Hotkey::Num9 => Some(Key::Num9),
-            Hotkey::A => Some(Key::KeyA), Hotkey::B => Some(Key::KeyB), Hotkey::C => Some(Key::KeyC),
-            Hotkey::D => Some(Key::KeyD), Hotkey::E => Some(Key::KeyE), Hotkey::F => Some(Key::KeyF),
-            Hotkey::G => Some(Key::KeyG), Hotkey::H => Some(Key::KeyH), Hotkey::I => Some(Key::KeyI),
-            Hotkey::J => Some(Key::KeyJ), Hotkey::K => Some(Key::KeyK), Hotkey::L => Some(Key::KeyL),
-            Hotkey::M => Some(Key::KeyM), Hotkey::N => Some(Key::KeyN), Hotkey::O => Some(Key::KeyO),
-            Hotkey::P => Some(Key::KeyP), Hotkey::Q => Some(Key::KeyQ), Hotkey::R => Some(Key::KeyR),
-            Hotkey::S => Some(Key::KeyS), Hotkey::T => Some(Key::KeyT), Hotkey::U => Some(Key::KeyU),
-            Hotkey::V => Some(Key::KeyV), Hotkey::W => Some(Key::KeyW), Hotkey::X => Some(Key::KeyX),
-            Hotkey::Y => Some(Key::KeyY), Hotkey::Z => Some(Key::KeyZ),
-        }
-    }
-
     pub fn to_vk(&self) -> i32 {
         match self {
             Hotkey::F1 => 0x70, Hotkey::F2 => 0x71, Hotkey::F3 => 0x72, Hotkey::F4 => 0x73,
@@ -140,6 +111,86 @@ impl Hotkey {
             Hotkey::U => 0x55, Hotkey::V => 0x56, Hotkey::W => 0x57, Hotkey::X => 0x58,
             Hotkey::Y => 0x59, Hotkey::Z => 0x5A,
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModifierKey {
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+impl ModifierKey {
+    pub fn to_vk(&self) -> i32 {
+        match self {
+            ModifierKey::Ctrl => 0x11,
+            ModifierKey::Alt => 0x12,
+            ModifierKey::Shift => 0x10,
+        }
+    }
+
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            ModifierKey::Ctrl => "Ctrl",
+            ModifierKey::Alt => "Alt",
+            ModifierKey::Shift => "Shift",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct HotkeyBinding {
+    pub modifiers: Vec<ModifierKey>,
+    pub key: Hotkey,
+}
+
+impl HotkeyBinding {
+    pub fn new(key: Hotkey) -> Self {
+        HotkeyBinding {
+            modifiers: Vec::new(),
+            key,
+        }
+    }
+
+    pub fn from_string(s: &str) -> Self {
+        let mut modifiers: Vec<ModifierKey> = Vec::new();
+        let mut key = Hotkey::F9;
+        for part in s.split('+') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.to_uppercase().as_str() {
+                "CTRL" | "CONTROL" => modifiers.push(ModifierKey::Ctrl),
+                "ALT" => modifiers.push(ModifierKey::Alt),
+                "SHIFT" => modifiers.push(ModifierKey::Shift),
+                _ => key = hotkey_from_string(part),
+            }
+        }
+        modifiers.dedup();
+        HotkeyBinding { modifiers, key }
+    }
+
+    pub fn is_pressed(&self) -> bool {
+        for m in &self.modifiers {
+            if (unsafe { GetAsyncKeyState(m.to_vk()) } as u16 & 0x8000) == 0 {
+                return false;
+            }
+        }
+        (unsafe { GetAsyncKeyState(self.key.to_vk()) } as u16 & 0x8000) != 0
+    }
+}
+
+impl std::fmt::Display for HotkeyBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts: Vec<String> = self
+            .modifiers
+            .iter()
+            .map(|m| m.to_string().to_string())
+            .collect();
+        parts.push(self.key.to_string().to_string());
+        write!(f, "{}", parts.join("+"))
     }
 }
 
@@ -316,6 +367,34 @@ fn export_history(entries: &[HistoryEntry]) -> std::io::Result<String> {
     Ok(filename)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ModelPhase {
+    Idle,
+    Downloading,
+    Loading,
+    Ready,
+    Error,
+}
+
+#[derive(Clone)]
+struct ModelLoadState {
+    phase: ModelPhase,
+    downloaded: u64,
+    total: u64,
+    error: Option<String>,
+}
+
+impl Default for ModelLoadState {
+    fn default() -> Self {
+        Self {
+            phase: ModelPhase::Idle,
+            downloaded: 0,
+            total: 0,
+            error: None,
+        }
+    }
+}
+
 struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
@@ -324,9 +403,10 @@ struct AppState {
     pub filler_words: Mutex<String>,
     pub word_replacements: Mutex<String>,
     pub whisper_ctx: Mutex<Option<WhisperContext>>,
+    pub model_status: Mutex<ModelLoadState>,
     pub mic_gain: Mutex<f32>,
-    pub hotkey_record: Mutex<Hotkey>,
-    pub hotkey_exit: Mutex<Hotkey>,
+    pub hotkey_record: Mutex<HotkeyBinding>,
+    pub hotkey_exit: Mutex<HotkeyBinding>,
 }
 
 #[derive(PartialEq)]
@@ -587,19 +667,15 @@ use reqwest::blocking;
 
 const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin";
 
-fn ensure_model_exists(model_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    if model_path.exists() {
-        return Ok(());
-    }
-
+fn download_model(
+    model_path: &std::path::Path,
+    state: &AppState,
+    ctx: &egui::Context,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Create parent directory if needed
     if let Some(parent) = model_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    eprintln!("Модель не найдена, скачивание с Hugging Face...");
-    eprintln!("URL: {}", MODEL_URL);
-    eprintln!("Куда: {}", model_path.display());
 
     let client = blocking::Client::new();
     let mut response = client.get(MODEL_URL).send()?;
@@ -609,8 +685,20 @@ fn ensure_model_exists(model_path: &std::path::Path) -> Result<(), Box<dyn std::
     }
 
     let total_size = response.content_length().unwrap_or(0);
+    {
+        let mut st = state.model_status.lock().unwrap();
+        st.phase = ModelPhase::Downloading;
+        st.downloaded = 0;
+        st.total = total_size;
+        st.error = None;
+    }
+    ctx.request_repaint();
+
+    // Пишем во временный файл, а по завершении переименовываем —
+    // так оборванное скачивание не оставит «битую» модель.
+    let tmp_path = model_path.with_extension("download");
+    let mut file = std::fs::File::create(&tmp_path)?;
     let mut downloaded: u64 = 0;
-    let mut file = std::fs::File::create(model_path)?;
 
     const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
     let mut buffer = vec![0u8; CHUNK_SIZE];
@@ -622,13 +710,58 @@ fn ensure_model_exists(model_path: &std::path::Path) -> Result<(), Box<dyn std::
         }
         std::io::Write::write_all(&mut file, &buffer[..bytes_read])?;
         downloaded += bytes_read as u64;
-        if total_size > 0 {
-            let percent = (downloaded as f64 / total_size as f64 * 100.0) as u32;
-            eprint!("\rПрогресс: {}% ({:.1}/{:.1} MB)", percent, downloaded as f64 / 1_048_576.0, total_size as f64 / 1_048_576.0);
+        {
+            let mut st = state.model_status.lock().unwrap();
+            st.downloaded = downloaded;
         }
+        ctx.request_repaint();
     }
-    eprintln!("\nМодель скачана успешно!");
+    drop(file);
+
+    std::fs::rename(&tmp_path, model_path)?;
     Ok(())
+}
+
+fn start_model_loader(state: Arc<AppState>, ctx: egui::Context, model_path: std::path::PathBuf) {
+    thread::spawn(move || {
+        if !model_path.exists() {
+            if let Err(e) = download_model(&model_path, &state, &ctx) {
+                let mut st = state.model_status.lock().unwrap();
+                st.phase = ModelPhase::Error;
+                st.error = Some(e.to_string());
+                drop(st);
+                ctx.request_repaint();
+                return;
+            }
+        }
+
+        {
+            let mut st = state.model_status.lock().unwrap();
+            st.phase = ModelPhase::Loading;
+            drop(st);
+        }
+        ctx.request_repaint();
+
+        match WhisperContext::new_with_params(
+            model_path.to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
+        ) {
+            Ok(c) => {
+                *state.whisper_ctx.lock().unwrap() = Some(c);
+                let mut st = state.model_status.lock().unwrap();
+                st.phase = ModelPhase::Ready;
+                st.error = None;
+                drop(st);
+            }
+            Err(e) => {
+                let mut st = state.model_status.lock().unwrap();
+                st.phase = ModelPhase::Error;
+                st.error = Some(format!("Не удалось загрузить модель: {}", e));
+                drop(st);
+            }
+        }
+        ctx.request_repaint();
+    });
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -650,34 +783,18 @@ impl VoiceGUI {
             .unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".to_string());
         let model_path_buf = std::path::PathBuf::from(&model_path);
 
-        // Download model if missing
-        if let Err(e) = ensure_model_exists(&model_path_buf) {
-            eprintln!("Ошибка скачивания модели: {}", e);
-        }
-
         let filler_words = std::env::var("FILLER_WORDS")
             .unwrap_or_else(|_| "эм,ну,как бы,типа,короче".to_string());
         let word_replacements = std::env::var("WORD_REPLACEMENTS")
             .unwrap_or_else(|_| "дефис=-\nдвоеточие=:\nточка с запятой=;\nоткрывающая скобка=(\nзакрывающая скобка=)".to_string());
 
-        let whisper_ctx = WhisperContext::new_with_params(
-            &model_path,
-            WhisperContextParameters::default(),
-        ).ok();
-
-        if whisper_ctx.is_none() {
-            eprintln!("Не удалось загрузить модель: {}", model_path);
-        } else {
-            println!("Модель загружена успешно: {}", model_path);
-        }
-
         // Load hotkeys from .env
         let record_hotkey = std::env::var("HOTKEY_RECORD")
-            .map(|s| hotkey_from_string(&s))
-            .unwrap_or(Hotkey::F9);
+            .map(|s| HotkeyBinding::from_string(&s))
+            .unwrap_or_else(|_| HotkeyBinding::new(Hotkey::F9));
         let exit_hotkey = std::env::var("HOTKEY_EXIT")
-            .map(|s| hotkey_from_string(&s))
-            .unwrap_or(Hotkey::F12);
+            .map(|s| HotkeyBinding::from_string(&s))
+            .unwrap_or_else(|_| HotkeyBinding::new(Hotkey::F12));
 
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
@@ -686,11 +803,16 @@ impl VoiceGUI {
             model_path: Mutex::new(model_path),
             filler_words: Mutex::new(filler_words),
             word_replacements: Mutex::new(word_replacements),
-            whisper_ctx: Mutex::new(whisper_ctx),
+            whisper_ctx: Mutex::new(None),
+            model_status: Mutex::new(ModelLoadState::default()),
             mic_gain: Mutex::new(10.0),
             hotkey_record: Mutex::new(record_hotkey),
             hotkey_exit: Mutex::new(exit_hotkey),
         });
+
+        // Скачивание (при необходимости) и загрузка модели идут в фоне,
+        // чтобы не блокировать запуск интерфейса.
+        start_model_loader(state.clone(), cc.egui_ctx.clone(), model_path_buf);
 
         start_background_workers(state.clone(), cc.egui_ctx.clone());
         start_widget_repaint_loop(cc.egui_ctx.clone());
@@ -707,9 +829,9 @@ impl VoiceGUI {
 }
 
 impl VoiceGUI {
-    fn save_hotkey_to_env(&self, key_name: &str, hotkey: Hotkey) {
+    fn save_hotkey_to_env(&self, key_name: &str, binding: &HotkeyBinding) {
         let env_path = std::path::Path::new(".env");
-        let key_str = hotkey.to_string();
+        let key_str = binding.to_string();
         
         let mut lines: Vec<String> = if env_path.exists() {
             std::fs::read_to_string(env_path)
@@ -770,20 +892,31 @@ ctx.set_style(style);
         if let Some(action) = self.waiting_for_hotkey {
             ctx.input(|i| {
                 for event in &i.events {
-                    if let egui::Event::Key { key, pressed: true, .. } = event {
-                        if *key == egui::Key::Escape {
+                    if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                        if *key == egui::Key::Escape && modifiers.is_none() {
                             self.waiting_for_hotkey = None;
                             return;
                         }
                         if let Some(hk) = egui_key_to_hotkey(*key) {
+                            let mut mods: Vec<ModifierKey> = Vec::new();
+                            if modifiers.ctrl {
+                                mods.push(ModifierKey::Ctrl);
+                            }
+                            if modifiers.alt {
+                                mods.push(ModifierKey::Alt);
+                            }
+                            if modifiers.shift {
+                                mods.push(ModifierKey::Shift);
+                            }
+                            let binding = HotkeyBinding { modifiers: mods, key: hk };
                             match action {
                                 HotkeyAction::Record => {
-                                    *self.state.hotkey_record.lock().unwrap() = hk;
-                                    self.save_hotkey_to_env("HOTKEY_RECORD", hk);
+                                    *self.state.hotkey_record.lock().unwrap() = binding.clone();
+                                    self.save_hotkey_to_env("HOTKEY_RECORD", &binding);
                                 }
                                 HotkeyAction::Exit => {
-                                    *self.state.hotkey_exit.lock().unwrap() = hk;
-                                    self.save_hotkey_to_env("HOTKEY_EXIT", hk);
+                                    *self.state.hotkey_exit.lock().unwrap() = binding.clone();
+                                    self.save_hotkey_to_env("HOTKEY_EXIT", &binding);
                                 }
                             }
                             self.waiting_for_hotkey = None;
@@ -832,10 +965,10 @@ ctx.set_style(style);
 
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("Горячие клавиши:").size(11.0).color(egui::Color32::GRAY));
-                    let record_hk = *self.state.hotkey_record.lock().unwrap();
-                    let exit_hk = *self.state.hotkey_exit.lock().unwrap();
-                    ui.label(egui::RichText::new(format!("{} — Запись (зажмите)", record_hk.to_string())).size(11.0).color(egui::Color32::GRAY));
-                    ui.label(egui::RichText::new(format!("{} — Выход", exit_hk.to_string())).size(11.0).color(egui::Color32::GRAY));
+                    let record_hk = self.state.hotkey_record.lock().unwrap().clone();
+                    let exit_hk = self.state.hotkey_exit.lock().unwrap().clone();
+                    ui.label(egui::RichText::new(format!("{} — Запись (зажмите)", record_hk)).size(11.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new(format!("{} — Выход", exit_hk)).size(11.0).color(egui::Color32::GRAY));
                 });
             });
 
@@ -1005,18 +1138,18 @@ ctx.set_style(style);
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            ui.label(egui::RichText::new("Клавиша записи (зажать):").size(13.0));
+                            ui.label(egui::RichText::new("Комбинация записи (зажать):").size(13.0));
                         });
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let record_hk = *self.state.hotkey_record.lock().unwrap();
+                            let record_hk = self.state.hotkey_record.lock().unwrap().clone();
                             
-                            ui.label(egui::RichText::new(format!("Текущая: {}", record_hk.to_string())).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
+                            ui.label(egui::RichText::new(format!("Текущая: {}", record_hk)).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
                             ui.add_space(10.0);
                             
                             let waiting_record = matches!(self.waiting_for_hotkey, Some(HotkeyAction::Record));
-                            let btn_text = if waiting_record { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить клавишу" };
+                            let btn_text = if waiting_record { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить комбинацию" };
                             let btn = ui.add_enabled(!waiting_record, egui::Button::new(btn_text)
                                 .fill(if waiting_record { egui::Color32::YELLOW } else { egui::Color32::from_rgb(70, 130, 180) })
                                 .min_size(egui::vec2(200.0, 30.0)));
@@ -1028,18 +1161,18 @@ ctx.set_style(style);
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            ui.label(egui::RichText::new("Клавиша выхода:").size(13.0));
+                            ui.label(egui::RichText::new("Комбинация выхода:").size(13.0));
                         });
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let exit_hk = *self.state.hotkey_exit.lock().unwrap();
+                            let exit_hk = self.state.hotkey_exit.lock().unwrap().clone();
                             
-                            ui.label(egui::RichText::new(format!("Текущая: {}", exit_hk.to_string())).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
+                            ui.label(egui::RichText::new(format!("Текущая: {}", exit_hk)).size(13.0).monospace().color(egui::Color32::from_rgb(100, 180, 255)));
                             ui.add_space(10.0);
                             
                             let waiting_exit = matches!(self.waiting_for_hotkey, Some(HotkeyAction::Exit));
-                            let btn_text = if waiting_exit { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить клавишу" };
+                            let btn_text = if waiting_exit { "⌨ Жду нажатия... (ESC для отмены)" } else { "🎮 Назначить комбинацию" };
                             let btn = ui.add_enabled(!waiting_exit, egui::Button::new(btn_text)
                                 .fill(if waiting_exit { egui::Color32::YELLOW } else { egui::Color32::from_rgb(70, 130, 180) })
                                 .min_size(egui::vec2(200.0, 30.0)));
@@ -1051,7 +1184,7 @@ ctx.set_style(style);
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            ui.label(egui::RichText::new("⚠️ Изменения вступят в силу после перезапуска").small().color(egui::Color32::YELLOW));
+                            ui.label(egui::RichText::new("💾 Комбинация сохраняется в .env и применяется сразу").small().color(egui::Color32::GRAY));
                         });
 
                         ui.add_space(20.0);
@@ -1095,6 +1228,71 @@ ctx.set_style(style);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("⚠️ После смены пути перезапустите приложение").small().color(egui::Color32::YELLOW));
+                        });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let ms = self.state.model_status.lock().unwrap().clone();
+                            match ms.phase {
+                                ModelPhase::Idle => {
+                                    ui.label(egui::RichText::new("⬇ Модель ещё не загружена").size(13.0).color(egui::Color32::GRAY));
+                                }
+                                ModelPhase::Downloading => {
+                                    let frac = if ms.total > 0 {
+                                        ms.downloaded as f32 / ms.total as f32
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(300.0)
+                                            .show_percentage(),
+                                    );
+                                    let text = if ms.total > 0 {
+                                        format!(
+                                            "{:.0} / {:.0} МБ",
+                                            ms.downloaded as f64 / 1_048_576.0,
+                                            ms.total as f64 / 1_048_576.0
+                                        )
+                                    } else {
+                                        format!("{:.0} МБ", ms.downloaded as f64 / 1_048_576.0)
+                                    };
+                                    ui.label(egui::RichText::new(text).size(12.0).color(egui::Color32::GRAY));
+                                }
+                                ModelPhase::Loading => {
+                                    ui.label(egui::RichText::new("⏳ Загрузка модели в память...").size(13.0).color(egui::Color32::YELLOW));
+                                }
+                                ModelPhase::Ready => {
+                                    ui.label(egui::RichText::new("✅ Модель загружена").size(13.0).color(egui::Color32::from_rgb(80, 255, 120)));
+                                }
+                                ModelPhase::Error => {
+                                    let err = ms.error.clone().unwrap_or_default();
+                                    ui.label(egui::RichText::new(format!("❌ {}", err)).size(13.0).color(egui::Color32::from_rgb(255, 80, 80)));
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let path_str = self.state.model_path.lock().unwrap().clone();
+                            let busy = matches!(
+                                self.state.model_status.lock().unwrap().phase,
+                                ModelPhase::Downloading | ModelPhase::Loading
+                            );
+                            let btn_text = if path_str.trim().is_empty() {
+                                "⬇ Скачать модель"
+                            } else {
+                                "⬇ Скачать / перезагрузить модель"
+                            };
+                            let btn = ui.add_enabled(
+                                !busy,
+                                egui::Button::new(btn_text).min_size(egui::vec2(230.0, 28.0)),
+                            );
+                            if btn.clicked() {
+                                let path_buf = std::path::PathBuf::from(path_str.trim());
+                                start_model_loader(self.state.clone(), ui.ctx().clone(), path_buf);
+                            }
                         });
 
                         ui.add_space(20.0);
@@ -1163,6 +1361,7 @@ ctx.set_style(style);
             let is_rec = status.contains("Запись");
             let is_proc = status.contains("Обработка");
             let show_widget_clone = self.show_widget.clone();
+            let record_name = self.state.hotkey_record.lock().unwrap().to_string();
 
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("floating_status_widget"),
@@ -1197,7 +1396,7 @@ ctx.set_style(style);
                                 ui.label(egui::RichText::new("ОБРАБОТКА").color(egui::Color32::from_rgb(255, 200, 80)).strong().size(13.0).monospace());
                             } else {
                                 ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(80, 255, 120)));
-                                ui.label(egui::RichText::new("ГОТОВ (F9)").color(egui::Color32::from_rgb(80, 255, 120)).size(13.0).monospace());
+                                ui.label(egui::RichText::new(format!("ГОТОВ ({})", record_name)).color(egui::Color32::from_rgb(80, 255, 120)).size(13.0).monospace());
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1227,9 +1426,6 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     // Отслеживаем горячие клавиши через прямой опрос состояния клавиш.
     // Это надёжнее низкоуровневого хука: опрос не зависит от активного окна
     // и его не перехватывают сторонние хуки (драйверы GPU и т.п.).
-    let record_vk = state_for_keys.hotkey_record.lock().unwrap().to_vk();
-    let exit_vk = state_for_keys.hotkey_exit.lock().unwrap().to_vk();
-
     thread::spawn(move || {
         let mut prev_record_down = false;
         let mut prev_exit_down = false;
@@ -1237,8 +1433,8 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
         loop {
             thread::sleep(Duration::from_millis(15));
 
-            let record_down = (unsafe { GetAsyncKeyState(record_vk) } as u16 & 0x8000) != 0;
-            let exit_down = (unsafe { GetAsyncKeyState(exit_vk) } as u16 & 0x8000) != 0;
+            let record_down = state_for_keys.hotkey_record.lock().unwrap().is_pressed();
+            let exit_down = state_for_keys.hotkey_exit.lock().unwrap().is_pressed();
 
             if record_down && !prev_record_down && !state_for_keys.is_recording.load(Ordering::SeqCst) {
                 state_for_keys.is_recording.store(true, Ordering::SeqCst);
@@ -1275,6 +1471,12 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                     let replacements_raw = state.word_replacements.lock().unwrap().clone();
 
                     if !audio_samples.is_empty() {
+                        if state.whisper_ctx.lock().unwrap().is_none() {
+                            *state.status.lock().unwrap() = "⏳ Модель ещё загружается, повторите позже".to_string();
+                            ctx.request_repaint();
+                            continue;
+                        }
+
                         let filler_words = parse_filler_words(&words_raw);
                         let word_replacements = parse_word_replacements(&replacements_raw);
 
@@ -1308,7 +1510,10 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                         }
                     }
 
-                    *state.status.lock().unwrap() = "🟢 Ожидание (Зажмите F9)".to_string();
+                    *state.status.lock().unwrap() = format!(
+                        "🟢 Ожидание (Зажмите {})",
+                        state.hotkey_record.lock().unwrap()
+                    );
                     ctx.request_repaint();
                 }
             }

@@ -1,4 +1,6 @@
 /target
+/dist
+/whisper_flow_rust.exe
 .env
 *.wav
 history.jsonl
