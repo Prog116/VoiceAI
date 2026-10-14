@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use arboard::Clipboard;
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 use eframe::egui;
@@ -321,6 +322,66 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn month_name_ru(month: u32) -> &'static str {
+    match month {
+        1 => "января",
+        2 => "февраля",
+        3 => "марта",
+        4 => "апреля",
+        5 => "мая",
+        6 => "июня",
+        7 => "июля",
+        8 => "августа",
+        9 => "сентября",
+        10 => "октября",
+        11 => "ноября",
+        12 => "декабря",
+        _ => "",
+    }
+}
+
+/// Возвращает относительный заголовок группы по числу прошедших дней.
+/// `None` означает, что запись старше описанных групп и её нужно
+/// подписать конкретной датой.
+fn group_label_for_days(days_ago: i64) -> Option<&'static str> {
+    if days_ago <= 0 {
+        Some("Сегодня")
+    } else if days_ago == 1 {
+        Some("Вчера")
+    } else if days_ago <= 6 {
+        Some("На прошлой неделе")
+    } else {
+        None
+    }
+}
+
+fn date_group_label(timestamp: u64, today: NaiveDate) -> String {
+    let dt = match Local.timestamp_opt(timestamp as i64, 0).single() {
+        Some(dt) => dt,
+        None => return "Дата неизвестна".to_string(),
+    };
+    let days_ago = (today - dt.date_naive()).num_days();
+    if let Some(label) = group_label_for_days(days_ago) {
+        return label.to_string();
+    }
+    format!("{} {} {}", dt.day(), month_name_ru(dt.month()), dt.year())
+}
+
+fn entry_time_label(timestamp: u64) -> String {
+    match Local.timestamp_opt(timestamp as i64, 0).single() {
+        Some(dt) => dt.format("%H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
+fn parse_mic_gain(raw: &str) -> f32 {
+    raw.trim()
+        .parse::<f32>()
+        .ok()
+        .unwrap_or(10.0)
+        .clamp(1.0, 50.0)
 }
 
 fn load_history() -> Vec<HistoryEntry> {
@@ -767,6 +828,33 @@ fn start_model_loader(state: Arc<AppState>, ctx: egui::Context, model_path: std:
 #[derive(PartialEq, Clone, Copy)]
 enum HotkeyAction { Record, Exit }
 
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // egui поставляется с ограниченным набором эмодзи, из-за чего часть
+    // символов рисуется «квадратиками». Добавляем системный шрифт символов
+    // Windows (содержит таблицу glyf, поэтому egui умеет его растеризовать).
+    let candidates = [
+        "C:\\Windows\\Fonts\\seguiemj.ttf",
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+    ];
+    if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+        let name = "system_symbols".to_owned();
+        fonts
+            .font_data
+            .insert(name.clone(), egui::FontData::from_owned(bytes));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push(name.clone());
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 struct VoiceGUI {
     state: Arc<AppState>,
     active_tab: AppTab,
@@ -774,11 +862,13 @@ struct VoiceGUI {
     search_query: String,
     dark_mode: bool,
     waiting_for_hotkey: Option<HotkeyAction>,
+    collapsed_groups: std::collections::HashSet<String>,
 }
 
 impl VoiceGUI {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         dotenvy::dotenv().ok();
+        configure_fonts(&cc.egui_ctx);
         let model_path = std::env::var("WHISPER_MODEL_PATH")
             .unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".to_string());
         let model_path_buf = std::path::PathBuf::from(&model_path);
@@ -796,6 +886,10 @@ impl VoiceGUI {
             .map(|s| HotkeyBinding::from_string(&s))
             .unwrap_or_else(|_| HotkeyBinding::new(Hotkey::F12));
 
+        let mic_gain = std::env::var("MIC_GAIN")
+            .map(|s| parse_mic_gain(&s))
+            .unwrap_or(10.0);
+
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
             status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
@@ -805,7 +899,7 @@ impl VoiceGUI {
             word_replacements: Mutex::new(word_replacements),
             whisper_ctx: Mutex::new(None),
             model_status: Mutex::new(ModelLoadState::default()),
-            mic_gain: Mutex::new(10.0),
+            mic_gain: Mutex::new(mic_gain),
             hotkey_record: Mutex::new(record_hotkey),
             hotkey_exit: Mutex::new(exit_hotkey),
         });
@@ -824,6 +918,7 @@ impl VoiceGUI {
             search_query: String::new(),
             dark_mode: true,
             waiting_for_hotkey: None,
+            collapsed_groups: std::collections::HashSet::new(),
         }
     }
 }
@@ -875,6 +970,11 @@ impl VoiceGUI {
     fn save_word_replacements(&self) {
         let value = self.state.word_replacements.lock().unwrap().clone();
         upsert_env_line("WORD_REPLACEMENTS", &value);
+    }
+
+    fn save_mic_gain(&self) {
+        let value = *self.state.mic_gain.lock().unwrap();
+        upsert_env_line("MIC_GAIN", &format!("{:.0}", value));
     }
 }
 
@@ -1056,15 +1156,144 @@ ctx.set_style(style);
                             let query = self.search_query.to_lowercase();
                             let mut to_delete: Option<usize> = None;
 
-                            for (i, entry) in history.iter().enumerate() {
-                                if !query.is_empty() && !entry.text.to_lowercase().contains(&query) {
-                                    continue;
-                                }
+                            if history.is_empty() {
                                 ui.horizontal(|ui| {
                                     ui.add_space(15.0);
-                                    let response = ui.add(egui::Label::new(
-                                        egui::RichText::new(&entry.text).size(13.0)
-                                    ).sense(egui::Sense::click()));
+                                    ui.label(
+                                        egui::RichText::new("История пуста — запишите первую фразу")
+                                            .size(13.0)
+                                            .italics()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                });
+                            }
+
+                            // Группируем по дате: заголовки «Сегодня», «Вчера» и т.д.
+                            let today = Local::now().date_naive();
+                            let filtered: Vec<(usize, String)> = history
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, e)| {
+                                    query.is_empty() || e.text.to_lowercase().contains(&query)
+                                })
+                                .map(|(i, e)| (i, date_group_label(e.timestamp, today)))
+                                .collect();
+
+                            if !history.is_empty() && filtered.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(15.0);
+                                    ui.label(
+                                        egui::RichText::new("Ничего не найдено")
+                                            .size(13.0)
+                                            .italics()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                });
+                            }
+
+                            // Количество записей в каждой группе — для бейджа в заголовке.
+                            let mut group_counts: Vec<(String, usize)> = Vec::new();
+                            for (_, label) in &filtered {
+                                match group_counts.last_mut() {
+                                    Some(last) if &last.0 == label => last.1 += 1,
+                                    _ => group_counts.push((label.clone(), 1)),
+                                }
+                            }
+
+                            let mut group_index = 0usize;
+                            let mut current_group = String::new();
+                            let mut current_collapsed = false;
+                            let mut toggle_group: Option<String> = None;
+
+                            for (i, label) in &filtered {
+                                let i = *i;
+                                let entry = &history[i];
+
+                                if *label != current_group {
+                                    current_group = label.clone();
+                                    current_collapsed =
+                                        self.collapsed_groups.contains(&current_group);
+                                    let count = group_counts
+                                        .get(group_index)
+                                        .map(|g| g.1)
+                                        .unwrap_or(0);
+                                    group_index += 1;
+
+                                    ui.add_space(12.0);
+                                    let header = ui.horizontal(|ui| {
+                                        ui.add_space(15.0);
+                                        let arrow = if current_collapsed { "▶" } else { "▼" };
+                                        ui.label(
+                                            egui::RichText::new(arrow)
+                                                .size(9.0)
+                                                .color(egui::Color32::from_rgb(120, 170, 220)),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(&current_group)
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(120, 170, 220)),
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(count.to_string())
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(130, 130, 140)),
+                                        );
+                                    });
+                                    let mut header_rect = header.response.rect;
+                                    header_rect.max.x = ui.max_rect().right();
+                                    let header = ui.interact(
+                                        header_rect,
+                                        ui.make_persistent_id((
+                                            "history_group_toggle",
+                                            &current_group,
+                                        )),
+                                        egui::Sense::click(),
+                                    );
+                                    if header.clicked() {
+                                        toggle_group = Some(current_group.clone());
+                                    }
+                                    if header.hovered() {
+                                        ui.ctx().output_mut(|o| {
+                                            o.cursor_icon = egui::CursorIcon::PointingHand
+                                        });
+                                    }
+                                    ui.add_space(3.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(12.0);
+                                        let width = (ui.available_width() - 12.0).max(0.0);
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(width, 1.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            0.0,
+                                            egui::Color32::from_rgb(58, 58, 66),
+                                        );
+                                    });
+                                    ui.add_space(if current_collapsed { 2.0 } else { 6.0 });
+                                }
+
+                                if current_collapsed {
+                                    continue;
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.add_space(15.0);
+                                    ui.label(
+                                        egui::RichText::new(entry_time_label(entry.timestamp))
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(120, 120, 130)),
+                                    );
+                                    ui.add_space(6.0);
+                                    let response = ui.add(
+                                        egui::Label::new(egui::RichText::new(&entry.text).size(13.0))
+                                            .sense(egui::Sense::click()),
+                                    );
                                     if response.clicked() {
                                         let mut clipboard = Clipboard::new().ok();
                                         if let Some(cb) = clipboard.as_mut() {
@@ -1072,21 +1301,42 @@ ctx.set_style(style);
                                         }
                                     }
                                     if response.hovered() {
-                                        ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                        ui.ctx().output_mut(|o| {
+                                            o.cursor_icon = egui::CursorIcon::PointingHand
+                                        });
                                     }
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("✕").on_hover_text("Удалить").clicked() {
-                                            to_delete = Some(i);
-                                        }
-                                        if ui.small_button("📋").on_hover_text("Копировать").clicked() {
-                                            let mut clipboard = Clipboard::new().ok();
-                                            if let Some(cb) = clipboard.as_mut() {
-                                                let _ = cb.set_text(entry.text.clone());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("✕")
+                                                .on_hover_text("Удалить")
+                                                .clicked()
+                                            {
+                                                to_delete = Some(i);
                                             }
-                                        }
-                                    });
+                                            if ui
+                                                .small_button("📋")
+                                                .on_hover_text("Копировать")
+                                                .clicked()
+                                            {
+                                                let mut clipboard = Clipboard::new().ok();
+                                                if let Some(cb) = clipboard.as_mut() {
+                                                    let _ = cb.set_text(entry.text.clone());
+                                                }
+                                            }
+                                        },
+                                    );
                                 });
-                                ui.add_space(2.0);
+                                ui.add_space(4.0);
+                            }
+
+                            if let Some(g) = toggle_group {
+                                if self.collapsed_groups.contains(&g) {
+                                    self.collapsed_groups.remove(&g);
+                                } else {
+                                    self.collapsed_groups.insert(g);
+                                }
                             }
 
                             if let Some(i) = to_delete {
@@ -1113,11 +1363,6 @@ ctx.set_style(style);
                                 self.dark_mode = !self.dark_mode;
                             }
                         });
-                        ui.add_space(5.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(20.0);
-                            ui.label(egui::RichText::new("Требуется перезапуск для полного применения").small().color(egui::Color32::GRAY));
-                        });
 
                         ui.add_space(20.0);
                         ui.separator();
@@ -1136,9 +1381,26 @@ ctx.set_style(style);
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let mut gain = self.state.mic_gain.lock().unwrap();
-                            ui.add(egui::Slider::new(&mut *gain, 1.0..=50.0).text("x").suffix("x").step_by(1.0));
-                            ui.label(egui::RichText::new(format!("{:.0}x", *gain)).size(13.0).color(egui::Color32::GRAY));
+                            let changed = {
+                                let mut gain = self.state.mic_gain.lock().unwrap();
+                                let changed = ui
+                                    .add(
+                                        egui::Slider::new(&mut *gain, 1.0..=50.0)
+                                            .text("x")
+                                            .suffix("x")
+                                            .step_by(1.0),
+                                    )
+                                    .changed();
+                                ui.label(
+                                    egui::RichText::new(format!("{:.0}x", *gain))
+                                        .size(13.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                changed
+                            };
+                            if changed {
+                                self.save_mic_gain();
+                            }
                         });
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
@@ -1638,6 +1900,55 @@ mod tests {
     }
 
     #[test]
+    fn groups_today() {
+        assert_eq!(group_label_for_days(0), Some("Сегодня"));
+        assert_eq!(group_label_for_days(-1), Some("Сегодня"));
+    }
+
+    #[test]
+    fn groups_yesterday() {
+        assert_eq!(group_label_for_days(1), Some("Вчера"));
+    }
+
+    #[test]
+    fn groups_last_week() {
+        assert_eq!(group_label_for_days(2), Some("На прошлой неделе"));
+        assert_eq!(group_label_for_days(6), Some("На прошлой неделе"));
+    }
+
+    #[test]
+    fn older_entries_have_no_relative_group() {
+        assert_eq!(group_label_for_days(7), None);
+        assert_eq!(group_label_for_days(30), None);
+    }
+
+    #[test]
+    fn month_names_in_genitive() {
+        assert_eq!(month_name_ru(1), "января");
+        assert_eq!(month_name_ru(10), "октября");
+        assert_eq!(month_name_ru(12), "декабря");
+    }
+
+    #[test]
+    fn parses_mic_gain() {
+        assert_eq!(parse_mic_gain("15"), 15.0);
+        assert_eq!(parse_mic_gain(" 12 "), 12.0);
+    }
+
+    #[test]
+    fn mic_gain_falls_back_to_default_on_garbage() {
+        assert_eq!(parse_mic_gain("abc"), 10.0);
+        assert_eq!(parse_mic_gain(""), 10.0);
+    }
+
+    #[test]
+    fn mic_gain_is_clamped() {
+        assert_eq!(parse_mic_gain("0"), 1.0);
+        assert_eq!(parse_mic_gain("100"), 50.0);
+        assert_eq!(parse_mic_gain("-5"), 1.0);
+    }
+
+    #[test]
     fn encode_env_value_quotes_plain() {
         assert_eq!(encode_env_value("F9"), "\"F9\"");
     }
@@ -1671,5 +1982,59 @@ mod tests {
             .collect();
         assert!(parsed.contains(&("FILLER_WORDS".to_string(), filler.to_string())));
         assert!(parsed.contains(&("WORD_REPLACEMENTS".to_string(), repl.to_string())));
+    }
+
+    #[test]
+    fn horizontal_header_interact_registers_click() {
+        use std::cell::Cell;
+        let ctx = egui::Context::default();
+        let clicked = Cell::new(false);
+
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            events,
+            ..Default::default()
+        };
+
+        let run = |events: Vec<egui::Event>| {
+            let _ = ctx.run(make_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let header = ui.horizontal(|ui| {
+                        ui.label("Сегодня");
+                    });
+                    let header = ui.interact(
+                        header.response.rect,
+                        ui.make_persistent_id("header_toggle_test"),
+                        egui::Sense::click(),
+                    );
+                    if header.clicked() {
+                        clicked.set(true);
+                    }
+                });
+            });
+        };
+
+        let pos = egui::pos2(30.0, 16.0);
+        run(vec![egui::Event::PointerMoved(pos)]);
+        run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+
+        assert!(clicked.get(), "клик по заголовку не зарегистрирован");
     }
 }

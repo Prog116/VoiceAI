@@ -10,6 +10,7 @@ cpal = "0.15"
 whisper-rs = { version = "0.16", features = ["cuda"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+chrono = "0.4"
 rdev = "0.5"
 arboard = "3.4"
 eframe = "0.27"
