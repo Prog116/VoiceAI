@@ -16,10 +16,33 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[repr(C)]
+struct Msg {
+    hwnd: *mut std::ffi::c_void,
+    message: u32,
+    w_param: usize,
+    l_param: isize,
+    time: u32,
+    pt_x: i32,
+    pt_y: i32,
+    l_private: u32,
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
+    fn PeekMessageW(
+        lpMsg: *mut Msg,
+        hWnd: *mut std::ffi::c_void,
+        wMsgFilterMin: u32,
+        wMsgFilterMax: u32,
+        wRemoveMsg: u32,
+    ) -> i32;
+    fn TranslateMessage(lpMsg: *const Msg) -> i32;
+    fn DispatchMessageW(lpMsg: *const Msg) -> isize;
 }
+
+const PM_REMOVE: u32 = 0x0001;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -520,6 +543,30 @@ impl Default for ModelLoadState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordingMode {
+    /// Нажал — говоришь, отпустил — стоп (как раньше).
+    Hold,
+    /// Рация: нажал — начало записи, нажал ещё раз — стоп.
+    Toggle,
+}
+
+impl RecordingMode {
+    pub fn as_env(&self) -> &'static str {
+        match self {
+            RecordingMode::Hold => "hold",
+            RecordingMode::Toggle => "toggle",
+        }
+    }
+}
+
+fn parse_recording_mode(raw: &str) -> RecordingMode {
+    match raw.trim().to_lowercase().as_str() {
+        "toggle" | "рация" | "walkie" => RecordingMode::Toggle,
+        _ => RecordingMode::Hold,
+    }
+}
+
 struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
@@ -532,6 +579,9 @@ struct AppState {
     pub mic_gain: Mutex<f32>,
     pub hotkey_record: Mutex<HotkeyBinding>,
     pub hotkey_exit: Mutex<HotkeyBinding>,
+    pub recording_mode: Mutex<RecordingMode>,
+    pub input_device: Mutex<String>,
+    pub input_devices: Mutex<Vec<String>>,
 }
 
 #[derive(PartialEq)]
@@ -540,9 +590,38 @@ enum AppTab {
     Settings,
 }
 
+fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn pick_input_device(host: &cpal::Host, selected: &str) -> Option<cpal::Device> {
+    if !selected.trim().is_empty() {
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if device.name().map(|n| n == selected).unwrap_or(false) {
+                    return Some(device);
+                }
+            }
+        }
+    }
+    host.default_input_device()
+}
+
 fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<f32> {
     let host = cpal::default_host();
-    let device = match host.default_input_device() {
+    let selected = state.input_device.lock().unwrap().clone();
+    let device = match pick_input_device(&host, &selected) {
         Some(d) => d,
         None => return Vec::new(),
     };
@@ -928,6 +1007,7 @@ struct VoiceGUI {
     waiting_for_hotkey: Option<HotkeyAction>,
     collapsed_groups: std::collections::HashSet<String>,
     main_hidden: Arc<AtomicBool>,
+    has_tray: bool,
 }
 
 impl VoiceGUI {
@@ -955,9 +1035,21 @@ impl VoiceGUI {
             .map(|s| parse_mic_gain(&s))
             .unwrap_or(10.0);
 
+        let recording_mode = std::env::var("RECORDING_MODE")
+            .map(|s| parse_recording_mode(&s))
+            .unwrap_or(RecordingMode::Hold);
+
+        let initial_status = match recording_mode {
+            RecordingMode::Hold => format!("Ожидание (Зажмите {})", record_hotkey),
+            RecordingMode::Toggle => format!("Ожидание (Нажмите {})", record_hotkey),
+        };
+
+        let input_device = std::env::var("INPUT_DEVICE").unwrap_or_default();
+        let input_devices = list_input_devices();
+
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
-            status: Mutex::new("Ожидание (Зажмите F9)".to_string()),
+            status: Mutex::new(initial_status),
             history: Mutex::new(load_history()),
             model_path: Mutex::new(model_path),
             filler_words: Mutex::new(filler_words),
@@ -967,6 +1059,9 @@ impl VoiceGUI {
             mic_gain: Mutex::new(mic_gain),
             hotkey_record: Mutex::new(record_hotkey),
             hotkey_exit: Mutex::new(exit_hotkey),
+            recording_mode: Mutex::new(recording_mode),
+            input_device: Mutex::new(input_device),
+            input_devices: Mutex::new(input_devices),
         });
 
         // Скачивание (при необходимости) и загрузка модели идут в фоне,
@@ -981,6 +1076,8 @@ impl VoiceGUI {
 
         let show_widget = Arc::new(AtomicBool::new(false));
 
+        let has_tray = start_tray(cc.egui_ctx.clone(), state.clone(), main_hidden.clone());
+
         Self {
             state,
             active_tab: AppTab::Main,
@@ -990,6 +1087,7 @@ impl VoiceGUI {
             waiting_for_hotkey: None,
             collapsed_groups: std::collections::HashSet::new(),
             main_hidden,
+            has_tray,
         }
     }
 }
@@ -1047,20 +1145,39 @@ impl VoiceGUI {
         let value = *self.state.mic_gain.lock().unwrap();
         upsert_env_line("MIC_GAIN", &format!("{:.0}", value));
     }
+
+    fn save_recording_mode(&self) {
+        let mode = *self.state.recording_mode.lock().unwrap();
+        upsert_env_line("RECORDING_MODE", mode.as_env());
+    }
+
+    fn save_input_device(&self) {
+        let value = self.state.input_device.lock().unwrap().clone();
+        upsert_env_line("INPUT_DEVICE", &value);
+    }
 }
 
 fn widget_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("floating_status_widget")
 }
 
+/// Невидимый дочерний viewport, который постоянно живёт за пределами экрана.
+/// Нужен, чтобы eframe продолжал обрабатывать кадры (и команды показа главного
+/// окна) даже когда главное окно скрыто в трей.
+fn heartbeat_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("voiceai_heartbeat")
+}
+
+static HEARTBEAT_PLACED: AtomicBool = AtomicBool::new(false);
+
 fn start_widget_repaint_loop(ctx: egui::Context) {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_millis(100));
+            // Держим главное окно свежим (статус и т.п.). Отдельные viewport'ы
+            // (виджет/heartbeat) сами запрашивают перерисовку из своих колбэков,
+            // иначе egui создаёт фантомные viewport'ы и лишние окна.
             ctx.request_repaint();
-            // Мини-виджет — отдельный (deferred) viewport, его нужно обновлять
-            // независимо от главного окна, даже когда оно скрыто.
-            ctx.request_repaint_of(widget_viewport_id());
         }
     });
 }
@@ -1097,6 +1214,132 @@ fn show_main_window(ctx: &egui::Context, hidden: &Arc<AtomicBool>) {
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
 }
 
+/// Рисует круглую иконку для трея.
+fn circle_rgba(size: u32, color: [u8; 4]) -> Vec<u8> {
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    let r = size as f32 / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - r;
+            let dy = y as f32 + 0.5 - r;
+            let coverage = (r - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let idx = ((y * size + x) * 4) as usize;
+                buf[idx] = color[0];
+                buf[idx + 1] = color[1];
+                buf[idx + 2] = color[2];
+                buf[idx + 3] = (color[3] as f32 * coverage) as u8;
+            }
+        }
+    }
+    buf
+}
+
+fn make_circle_icon(size: u32, color: [u8; 4]) -> Option<tray_icon::Icon> {
+    tray_icon::Icon::from_rgba(circle_rgba(size, color), size, size).ok()
+}
+
+/// Создаёт иконку в системном трее в отдельном потоке с собственным циклом
+/// сообщений. Иконка синяя в покое и красная во время записи; клик по ней
+/// (или пункт меню «Открыть») возвращает главное окно. Возвращает `true`,
+/// если трей удалось создать.
+fn start_tray(ctx: egui::Context, state: Arc<AppState>, main_hidden: Arc<AtomicBool>) -> bool {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+
+    thread::spawn(move || {
+        let blue_icon = make_circle_icon(32, [45, 130, 230, 255]);
+        let red_icon = make_circle_icon(32, [230, 60, 60, 255]);
+        let (Some(blue_icon), Some(red_icon)) = (blue_icon, red_icon) else {
+            let _ = tx.send(false);
+            return;
+        };
+
+        let menu = Menu::new();
+        let open_item = MenuItem::new("Открыть VoiceAI", true, None);
+        let exit_item = MenuItem::new("Выход", true, None);
+        let _ = menu.append(&open_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&exit_item);
+        let open_id = open_item.id().clone();
+        let exit_id = exit_item.id().clone();
+
+        let tray = match tray_icon::TrayIconBuilder::new()
+            .with_icon(blue_icon.clone())
+            .with_tooltip("VoiceAI — готов")
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()
+        {
+            Ok(tray) => tray,
+            Err(_) => {
+                let _ = tx.send(false);
+                return;
+            }
+        };
+
+        // Левый клик по иконке — показать главное окно.
+        {
+            let ctx = ctx.clone();
+            let main_hidden = main_hidden.clone();
+            tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+                if let tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_main_window(&ctx, &main_hidden);
+                }
+            }));
+        }
+
+        // Пункты контекстного меню.
+        {
+            let ctx = ctx.clone();
+            let main_hidden = main_hidden.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if event.id() == &open_id {
+                    show_main_window(&ctx, &main_hidden);
+                } else if event.id() == &exit_id {
+                    std::process::exit(0);
+                }
+            }));
+        }
+
+        let _ = tx.send(true);
+
+        let mut last_red = false;
+        loop {
+            // Прокачиваем оконные сообщения (клики, меню, обновление иконки).
+            let mut msg: Msg = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let red = state.is_recording.load(Ordering::Relaxed);
+            if red != last_red {
+                last_red = red;
+                let icon = if red { red_icon.clone() } else { blue_icon.clone() };
+                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_tooltip(Some(if red {
+                    "VoiceAI — идёт запись"
+                } else {
+                    "VoiceAI — готов"
+                }));
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+}
+
 /// Рисует содержимое мини-виджета. Вызывается как deferred viewport,
 /// поэтому работает в собственном кадре независимо от главного окна.
 fn draw_widget(
@@ -1105,6 +1348,8 @@ fn draw_widget(
     show_widget: &Arc<AtomicBool>,
     main_hidden: &Arc<AtomicBool>,
 ) {
+    // Виджет просит следующий кадр сам, чтобы не зависеть от главного окна.
+    ctx.request_repaint_after(Duration::from_millis(100));
     let status = state.status.lock().unwrap().clone();
     let is_rec = status.contains("Запись");
     let is_proc = status.contains("Обработка");
@@ -1176,10 +1421,11 @@ fn draw_widget(
 
 impl eframe::App for VoiceGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Закрытие главного окна: если включён мини-виджет, не выходим,
-        // а прячем окно — виджет продолжит работать. Клик по виджету вернёт окно.
+        // Закрытие главного окна: если есть трей или включён мини-виджет,
+        // не выходим, а прячем окно — вернуть его можно кликом по трею/виджету.
+        // Полный выход — F12 или пункт «Выход» в меню трея.
         if ctx.input(|i| i.viewport().close_requested())
-            && self.show_widget.load(Ordering::Relaxed)
+            && (self.has_tray || self.show_widget.load(Ordering::Relaxed))
         {
             self.main_hidden.store(true, Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1573,6 +1819,60 @@ ctx.set_style(style);
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
+                            ui.label(egui::RichText::new("Входное устройство:").size(13.0));
+                        });
+                        ui.add_space(5.0);
+                        let device_changed = {
+                            let mut selected = self.state.input_device.lock().unwrap().clone();
+                            let devices = self.state.input_devices.lock().unwrap().clone();
+                            let mut changed = false;
+                            ui.horizontal(|ui| {
+                                ui.add_space(20.0);
+                                let selected_text = if selected.trim().is_empty() {
+                                    "По умолчанию".to_string()
+                                } else {
+                                    selected.clone()
+                                };
+                                egui::ComboBox::from_id_source("input_device_combo")
+                                    .width(320.0)
+                                    .selected_text(selected_text)
+                                    .show_ui(ui, |ui| {
+                                        changed |= ui
+                                            .selectable_value(
+                                                &mut selected,
+                                                String::new(),
+                                                "По умолчанию",
+                                            )
+                                            .changed();
+                                        for name in &devices {
+                                            changed |= ui
+                                                .selectable_value(
+                                                    &mut selected,
+                                                    name.clone(),
+                                                    name,
+                                                )
+                                                .changed();
+                                        }
+                                    });
+                                if ui.button("🔄 Обновить").clicked() {
+                                    *self.state.input_devices.lock().unwrap() =
+                                        list_input_devices();
+                                }
+                            });
+                            (changed, selected)
+                        };
+                        if device_changed.0 {
+                            *self.state.input_device.lock().unwrap() = device_changed.1.clone();
+                            self.save_input_device();
+                        }
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("💾 Сохраняется автоматически").small().color(egui::Color32::GRAY));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
                             ui.label(egui::RichText::new("Усиление сигнала (gain):").size(13.0));
                         });
                         ui.add_space(5.0);
@@ -1669,6 +1969,49 @@ ctx.set_style(style);
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("💾 Комбинация сохраняется в .env и применяется сразу").small().color(egui::Color32::GRAY));
+                        });
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+
+                        // Режим записи
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("🎙 Режим записи").strong().size(16.0));
+                        });
+                        ui.add_space(10.0);
+                        let mode_changed = {
+                            let mut mode = self.state.recording_mode.lock().unwrap();
+                            let mut changed = false;
+                            ui.horizontal(|ui| {
+                                ui.add_space(20.0);
+                                changed |= ui
+                                    .radio_value(&mut *mode, RecordingMode::Hold, "Рация")
+                                    .on_hover_text("Нажмите и удерживайте, чтобы говорить; отпустите — стоп")
+                                    .changed();
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(20.0);
+                                changed |= ui
+                                    .radio_value(
+                                        &mut *mode,
+                                        RecordingMode::Toggle,
+                                        "Переключатель",
+                                    )
+                                    .on_hover_text("Нажмите — начало записи, нажмите ещё раз — стоп")
+                                    .changed();
+                            });
+                            changed
+                        };
+                        if mode_changed {
+                            self.save_recording_mode();
+                        }
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new("💾 Сохраняется автоматически").small().color(egui::Color32::GRAY));
                         });
 
                         ui.add_space(20.0);
@@ -1871,12 +2214,34 @@ ctx.set_style(style);
                     .with_inner_size([220.0, 52.0])
                     .with_always_on_top()
                     .with_decorations(false)
-                    .with_transparent(true),
+                    .with_transparent(true)
+                    .with_taskbar(false),
                 move |ctx, _class| {
                     draw_widget(ctx, &state, &show_widget, &main_hidden);
                 },
             );
         }
+
+        // Невидимый heartbeat, который держит eframe в рабочем состоянии,
+        // когда главное окно скрыто в трей, и позволяет вернуть его обратно.
+        ctx.show_viewport_deferred(
+            heartbeat_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_inner_size([1.0, 1.0])
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_taskbar(false),
+            |ctx, _class| {
+                if !HEARTBEAT_PLACED.swap(true, Ordering::Relaxed) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        -100000.0, -100000.0,
+                    )));
+                }
+                // Самостоятельно просим следующий кадр, чтобы heartbeat жил
+                // даже когда главное окно скрыто.
+                ctx.request_repaint_after(Duration::from_millis(50));
+            },
+        );
     }
 }
 fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
@@ -1893,16 +2258,40 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
         loop {
             thread::sleep(Duration::from_millis(15));
 
+            let mode = *state_for_keys.recording_mode.lock().unwrap();
             let record_down = state_for_keys.hotkey_record.lock().unwrap().is_pressed();
             let exit_down = state_for_keys.hotkey_exit.lock().unwrap().is_pressed();
+            let recording = state_for_keys.is_recording.load(Ordering::SeqCst);
 
-            if record_down && !prev_record_down && !state_for_keys.is_recording.load(Ordering::SeqCst) {
+            let mut start = false;
+            let mut stop = false;
+            match mode {
+                RecordingMode::Hold => {
+                    if record_down && !prev_record_down && !recording {
+                        start = true;
+                    }
+                    if !record_down && prev_record_down && recording {
+                        stop = true;
+                    }
+                }
+                RecordingMode::Toggle => {
+                    // Рация: каждое нажатие переключает запись.
+                    if record_down && !prev_record_down {
+                        if recording {
+                            stop = true;
+                        } else {
+                            start = true;
+                        }
+                    }
+                }
+            }
+
+            if start {
                 state_for_keys.is_recording.store(true, Ordering::SeqCst);
                 *state_for_keys.status.lock().unwrap() = "🔴 Запись...".to_string();
                 ctx_for_keys.request_repaint();
             }
-
-            if !record_down && prev_record_down && state_for_keys.is_recording.load(Ordering::SeqCst) {
+            if stop {
                 state_for_keys.is_recording.store(false, Ordering::SeqCst);
                 *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
                 ctx_for_keys.request_repaint();
@@ -1970,10 +2359,15 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                         }
                     }
 
-                    *state.status.lock().unwrap() = format!(
-                        "🟢 Ожидание (Зажмите {})",
-                        state.hotkey_record.lock().unwrap()
-                    );
+                    let idle_status = {
+                        let mode = *state.recording_mode.lock().unwrap();
+                        let hk = state.hotkey_record.lock().unwrap().to_string();
+                        match mode {
+                            RecordingMode::Hold => format!("🟢 Ожидание (Зажмите {})", hk),
+                            RecordingMode::Toggle => format!("🟢 Ожидание (Нажмите {})", hk),
+                        }
+                    };
+                    *state.status.lock().unwrap() = idle_status;
                     ctx.request_repaint();
                 }
             }
@@ -2006,8 +2400,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[test]
+    use super::*;    #[test]
     fn removes_single_filler_word() {
         let filler_words = vec!["эм".to_string()];
         let result = clean_text_locally("привет эм как дела", &filler_words);
@@ -2107,6 +2500,50 @@ mod tests {
         assert_eq!(parse_mic_gain("0"), 1.0);
         assert_eq!(parse_mic_gain("100"), 50.0);
         assert_eq!(parse_mic_gain("-5"), 1.0);
+    }
+
+    #[test]
+    fn parses_recording_mode_toggle() {
+        assert_eq!(parse_recording_mode("toggle"), RecordingMode::Toggle);
+        assert_eq!(parse_recording_mode("Рация"), RecordingMode::Toggle);
+        assert_eq!(parse_recording_mode(" Toggle "), RecordingMode::Toggle);
+    }
+
+    #[test]
+    fn recording_mode_defaults_to_hold() {
+        assert_eq!(parse_recording_mode("hold"), RecordingMode::Hold);
+        assert_eq!(parse_recording_mode(""), RecordingMode::Hold);
+        assert_eq!(parse_recording_mode("garbage"), RecordingMode::Hold);
+    }
+
+    #[test]
+    fn recording_mode_env_roundtrip() {
+        assert_eq!(
+            parse_recording_mode(RecordingMode::Toggle.as_env()),
+            RecordingMode::Toggle
+        );
+        assert_eq!(
+            parse_recording_mode(RecordingMode::Hold.as_env()),
+            RecordingMode::Hold
+        );
+    }
+
+    #[test]
+    fn listing_and_picking_input_device_does_not_panic() {
+        let _ = list_input_devices();
+        let host = cpal::default_host();
+        let _ = pick_input_device(&host, "");
+        let _ = pick_input_device(&host, "definitely-not-a-real-device-xyz");
+    }
+
+    #[test]
+    fn circle_icon_buffer_is_sized_and_centered() {
+        let size = 16u32;
+        let buf = circle_rgba(size, [255, 0, 0, 255]);
+        assert_eq!(buf.len(), (size * size * 4) as usize);
+        let center = (((size / 2) * size + size / 2) * 4) as usize;
+        assert_eq!(buf[center + 3], 255, "центр должен быть непрозрачным");
+        assert_eq!(buf[3], 0, "угол должен быть прозрачным");
     }
 
     #[test]
