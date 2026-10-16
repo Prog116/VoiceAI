@@ -21,6 +21,70 @@ extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateMutexW(
+        lpMutexAttributes: *mut std::ffi::c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn CreateEventW(
+        lpEventAttributes: *mut std::ffi::c_void,
+        bManualReset: i32,
+        bInitialState: i32,
+        lpName: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn OpenEventW(
+        dwDesiredAccess: u32,
+        bInheritHandle: i32,
+        lpName: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn SetEvent(hEvent: *mut std::ffi::c_void) -> i32;
+    fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    fn GetLastError() -> u32;
+}
+
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+const INFINITE: u32 = 0xFFFF_FFFF;
+const WAIT_OBJECT_0: u32 = 0;
+
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\VoiceAI_single_instance_mutex";
+const SHOW_EVENT_NAME: &str = "Local\\VoiceAI_show_event";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Пытается стать единственным экземпляром приложения.
+/// `None` — приложение уже запущено (новый запуск надо завершить).
+fn acquire_single_instance() -> Option<*mut std::ffi::c_void> {
+    let name = wide(SINGLE_INSTANCE_MUTEX);
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Some(handle);
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) };
+        None
+    } else {
+        Some(handle)
+    }
+}
+
+/// Просит уже запущенный экземпляр показать главное окно.
+fn signal_existing_instance() {
+    let name = wide(SHOW_EVENT_NAME);
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if !handle.is_null() {
+        unsafe {
+            SetEvent(handle);
+            CloseHandle(handle);
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct HistoryEntry {
     text: String,
@@ -863,6 +927,7 @@ struct VoiceGUI {
     dark_mode: bool,
     waiting_for_hotkey: Option<HotkeyAction>,
     collapsed_groups: std::collections::HashSet<String>,
+    main_hidden: Arc<AtomicBool>,
 }
 
 impl VoiceGUI {
@@ -911,14 +976,20 @@ impl VoiceGUI {
         start_background_workers(state.clone(), cc.egui_ctx.clone());
         start_widget_repaint_loop(cc.egui_ctx.clone());
 
+        let main_hidden = Arc::new(AtomicBool::new(false));
+        start_show_signal_worker(cc.egui_ctx.clone(), main_hidden.clone());
+
+        let show_widget = Arc::new(AtomicBool::new(false));
+
         Self {
             state,
             active_tab: AppTab::Main,
-            show_widget: Arc::new(AtomicBool::new(false)),
+            show_widget,
             search_query: String::new(),
             dark_mode: true,
             waiting_for_hotkey: None,
             collapsed_groups: std::collections::HashSet::new(),
+            main_hidden,
         }
     }
 }
@@ -978,17 +1049,143 @@ impl VoiceGUI {
     }
 }
 
+fn widget_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("floating_status_widget")
+}
+
 fn start_widget_repaint_loop(ctx: egui::Context) {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_millis(100));
             ctx.request_repaint();
+            // Мини-виджет — отдельный (deferred) viewport, его нужно обновлять
+            // независимо от главного окна, даже когда оно скрыто.
+            ctx.request_repaint_of(widget_viewport_id());
+        }
+    });
+}
+
+fn start_show_signal_worker(ctx: egui::Context, main_hidden: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let name = wide(SHOW_EVENT_NAME);
+        let handle = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return;
+        }
+        loop {
+            if unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0 {
+                main_hidden.store(false, Ordering::Relaxed);
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(true),
+                );
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        }
+    });
+}
+
+fn show_main_window(ctx: &egui::Context, hidden: &Arc<AtomicBool>) {
+    hidden.store(false, Ordering::Relaxed);
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+}
+
+/// Рисует содержимое мини-виджета. Вызывается как deferred viewport,
+/// поэтому работает в собственном кадре независимо от главного окна.
+fn draw_widget(
+    ctx: &egui::Context,
+    state: &Arc<AppState>,
+    show_widget: &Arc<AtomicBool>,
+    main_hidden: &Arc<AtomicBool>,
+) {
+    let status = state.status.lock().unwrap().clone();
+    let is_rec = status.contains("Запись");
+    let is_proc = status.contains("Обработка");
+    let record_name = state.hotkey_record.lock().unwrap().to_string();
+
+    let mut style = (*ctx.style()).clone();
+    style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(28, 28, 30, 245);
+    style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(32, 32, 36, 245);
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 52);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 68);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(70, 130, 180);
+    style.spacing.item_spacing = egui::vec2(10.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    ctx.set_style(style);
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let drag_resp = ui.interact(
+            ui.max_rect(),
+            ui.make_persistent_id("floating_widget_drag"),
+            egui::Sense::click_and_drag(),
+        );
+        if drag_resp.dragged() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag_resp.clicked() && main_hidden.load(Ordering::Relaxed) {
+            show_main_window(ctx, main_hidden);
+        }
+        if main_hidden.load(Ordering::Relaxed) {
+            let _ = drag_resp
+                .clone()
+                .on_hover_text("Клик — вернуть главное окно · F12 — выход");
+        }
+
+        let mut close_hovered = false;
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
+
+            if is_rec {
+                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(255, 80, 80)));
+                ui.label(egui::RichText::new("ЗАПИСЬ").color(egui::Color32::from_rgb(255, 80, 80)).strong().size(13.0).monospace());
+            } else if is_proc {
+                ui.label(egui::RichText::new("⚙").size(16.0).color(egui::Color32::from_rgb(255, 200, 80)));
+                ui.label(egui::RichText::new("ОБРАБОТКА").color(egui::Color32::from_rgb(255, 200, 80)).strong().size(13.0).monospace());
+            } else {
+                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(80, 255, 120)));
+                ui.label(egui::RichText::new(format!("ГОТОВ ({})", record_name)).color(egui::Color32::from_rgb(80, 255, 120)).size(13.0).monospace());
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn = ui.add_sized([24.0, 24.0], egui::Button::new("✕").frame(false));
+                if btn.clicked() {
+                    show_widget.store(false, Ordering::Relaxed);
+                    if main_hidden.load(Ordering::Relaxed) {
+                        show_main_window(ctx, main_hidden);
+                    }
+                }
+                if btn.hovered() {
+                    close_hovered = true;
+                }
+            });
+        });
+
+        if drag_resp.hovered() && !close_hovered {
+            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
         }
     });
 }
 
 impl eframe::App for VoiceGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Закрытие главного окна: если включён мини-виджет, не выходим,
+        // а прячем окно — виджет продолжит работать. Клик по виджету вернёт окно.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.show_widget.load(Ordering::Relaxed)
+        {
+            self.main_hidden.store(true, Ordering::Relaxed);
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         let mut style = (*ctx.style()).clone();
         style.visuals.window_fill = egui::Color32::from_rgb(28, 28, 30);
         style.visuals.panel_fill = egui::Color32::from_rgb(32, 32, 36);
@@ -1664,63 +1861,19 @@ ctx.set_style(style);
         });
 
         if self.show_widget.load(Ordering::Relaxed) {
-            let status = self.state.status.lock().unwrap().clone();
-            let is_rec = status.contains("Запись");
-            let is_proc = status.contains("Обработка");
-            let show_widget_clone = self.show_widget.clone();
-            let record_name = self.state.hotkey_record.lock().unwrap().to_string();
+            let state = self.state.clone();
+            let show_widget = self.show_widget.clone();
+            let main_hidden = self.main_hidden.clone();
 
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("floating_status_widget"),
+            ctx.show_viewport_deferred(
+                widget_viewport_id(),
                 egui::ViewportBuilder::default()
                     .with_inner_size([220.0, 52.0])
                     .with_always_on_top()
                     .with_decorations(false)
                     .with_transparent(true),
                 move |ctx, _class| {
-                    let mut style = (*ctx.style()).clone();
-                    style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(28, 28, 30, 245);
-                    style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(32, 32, 36, 245);
-                    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 52);
-                    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 68);
-                    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(70, 130, 180);
-                    style.spacing.item_spacing = egui::vec2(10.0, 6.0);
-                    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-                    ctx.set_style(style);
-
-                    let mut close_interacted = false;
-
-                    let panel_response = egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.spacing_mut().item_spacing.x = 10.0;
-
-                            if is_rec {
-                                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(255, 80, 80)));
-                                ui.label(egui::RichText::new("ЗАПИСЬ").color(egui::Color32::from_rgb(255, 80, 80)).strong().size(13.0).monospace());
-                            } else if is_proc {
-                                ui.label(egui::RichText::new("⚙").size(16.0).color(egui::Color32::from_rgb(255, 200, 80)));
-                                ui.label(egui::RichText::new("ОБРАБОТКА").color(egui::Color32::from_rgb(255, 200, 80)).strong().size(13.0).monospace());
-                            } else {
-                                ui.label(egui::RichText::new("●").size(16.0).color(egui::Color32::from_rgb(80, 255, 120)));
-                                ui.label(egui::RichText::new(format!("ГОТОВ ({})", record_name)).color(egui::Color32::from_rgb(80, 255, 120)).size(13.0).monospace());
-                            }
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let btn = ui.add_sized([24.0, 24.0], egui::Button::new("✕").frame(false));
-                                if btn.clicked() {
-                                    show_widget_clone.store(false, Ordering::Relaxed);
-                                }
-                                if btn.hovered() || btn.is_pointer_button_down_on() {
-                                    close_interacted = true;
-                                }
-                            });
-                        });
-                    });
-
-                    if panel_response.response.dragged() || (panel_response.response.is_pointer_button_down_on() && !close_interacted) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
+                    draw_widget(ctx, &state, &show_widget, &main_hidden);
                 },
             );
         }
@@ -1828,6 +1981,15 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    // Только один экземпляр: иначе появляется второй мини-виджет.
+    let instance_guard = acquire_single_instance();
+    if instance_guard.is_none() {
+        // Приложение уже запущено — просим показать его окно и выходим.
+        signal_existing_instance();
+        std::process::exit(0);
+    }
+    let _instance_guard = instance_guard;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([450.0, 400.0])
@@ -1845,7 +2007,6 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn removes_single_filler_word() {
         let filler_words = vec!["эм".to_string()];
