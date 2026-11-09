@@ -5,13 +5,15 @@ use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 use eframe::egui;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 use rdev::{simulate, EventType, Key};
-use rfd;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -477,7 +479,7 @@ fn load_history() -> Vec<HistoryEntry> {
     };
     std::io::BufReader::new(file)
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<HistoryEntry>(&line).ok())
         .collect()
 }
@@ -575,6 +577,7 @@ struct AppState {
     pub filler_words: Mutex<String>,
     pub word_replacements: Mutex<String>,
     pub whisper_ctx: Mutex<Option<WhisperContext>>,
+    pub whisper_state: Mutex<Option<WhisperState>>,
     pub model_status: Mutex<ModelLoadState>,
     pub mic_gain: Mutex<f32>,
     pub hotkey_record: Mutex<HotkeyBinding>,
@@ -582,6 +585,10 @@ struct AppState {
     pub recording_mode: Mutex<RecordingMode>,
     pub input_device: Mutex<String>,
     pub input_devices: Mutex<Vec<String>>,
+    pub capture_buffer: Mutex<Vec<f32>>,
+    pub capture_sample_rate: AtomicU32,
+    pub capture_channels: AtomicUsize,
+    pub pending_audio: Mutex<VecDeque<(Vec<f32>, u32, usize)>>,
 }
 
 #[derive(PartialEq)]
@@ -618,69 +625,88 @@ fn pick_input_device(host: &cpal::Host, selected: &str) -> Option<cpal::Device> 
     host.default_input_device()
 }
 
-fn record_audio_until_stopped(state: Arc<AppState>) -> Vec<f32> {
-    let host = cpal::default_host();
-    let selected = state.input_device.lock().unwrap().clone();
-    let device = match pick_input_device(&host, &selected) {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
-
-    let supported_config = match device.default_input_config() {
-        Ok(sc) => sc,
-        Err(_) => return Vec::new(),
-    };
-
+fn build_capture_stream(
+    state: &Arc<AppState>,
+    host: &cpal::Host,
+    selected: &str,
+    stream_error: Arc<AtomicBool>,
+) -> Option<(cpal::Stream, u32, usize)> {
+    let device = pick_input_device(host, selected)?;
+    let supported_config = device.default_input_config().ok()?;
     let native_sample_rate = supported_config.sample_rate().0;
     let native_channels = supported_config.channels() as usize;
     let config: StreamConfig = supported_config.into();
 
-    let audio_data: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let audio_data_clone = audio_data.clone();
     let state_for_stream = state.clone();
+    let mut was_recording = false;
+    let stream = device
+        .build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let recording = state_for_stream.is_recording.load(Ordering::SeqCst);
+                if recording {
+                    let mut buffer = state_for_stream.capture_buffer.lock().unwrap();
+                    if !was_recording {
+                        buffer.clear();
+                    }
+                    buffer.extend_from_slice(data);
+                }
+                was_recording = recording;
+            },
+            move |_| stream_error.store(true, Ordering::SeqCst),
+            None,
+        )
+        .ok()?;
 
-    let stream = match device.build_input_stream(
-        &config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            if state_for_stream.is_recording.load(Ordering::SeqCst) {
-                let mut buffer = audio_data_clone.lock().unwrap();
-                buffer.extend_from_slice(data);
+    Some((stream, native_sample_rate, native_channels))
+}
+
+// Микрофон открывается один раз при старте и остаётся открытым: пропадает
+// задержка на инициализацию устройства и не теряется начало фразы.
+fn start_audio_capture(state: Arc<AppState>) {
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let mut active_device: Option<String> = None;
+        let mut stream: Option<cpal::Stream> = None;
+        let stream_error = Arc::new(AtomicBool::new(false));
+
+        loop {
+            let selected = state.input_device.lock().unwrap().clone();
+
+            let needs_rebuild = stream.is_none()
+                || stream_error.swap(false, Ordering::SeqCst)
+                || active_device.as_deref() != Some(selected.as_str());
+
+            if needs_rebuild {
+                stream = None;
+                active_device = Some(selected.clone());
+
+                if let Some((new_stream, sample_rate, channels)) =
+                    build_capture_stream(&state, &host, &selected, stream_error.clone())
+                {
+                    state
+                        .capture_sample_rate
+                        .store(sample_rate, Ordering::SeqCst);
+                    state.capture_channels.store(channels, Ordering::SeqCst);
+                    if new_stream.play().is_ok() {
+                        stream = Some(new_stream);
+                    }
+                }
             }
-        },
-        |_| {},
-        None,
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
 
-    if stream.play().is_err() {
-        return Vec::new();
-    }
-
-    while state.is_recording.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    drop(stream);
-
-    let raw_samples = audio_data.lock().unwrap();
-    if raw_samples.is_empty() {
-        return Vec::new();
-    }
-
-    let mut mono_samples = Vec::new();
-    if native_channels > 1 {
-        for chunk in raw_samples.chunks(native_channels) {
-            let sum: f32 = chunk.iter().sum();
-            mono_samples.push(sum / native_channels as f32);
+            thread::sleep(Duration::from_millis(500));
         }
-    } else {
-        mono_samples = raw_samples.clone();
-    }
+    });
+}
 
-    let processed_samples = process_audio_samples(&mono_samples, native_sample_rate, *state.mic_gain.lock().unwrap());
-    processed_samples
+fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    samples
+        .chunks(channels)
+        .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
+        .collect()
 }
 
 fn process_audio_samples(samples: &[f32], sample_rate: u32, gain: f32) -> Vec<f32> {
@@ -762,23 +788,7 @@ fn normalize_audio_aggressive(samples: &mut [f32]) {
     }
 }
 
-fn process_audio_pipeline(
-    state: &Arc<AppState>,
-    audio_samples: &[f32],
-    filler_words: &[String],
-    word_replacements: &[WordReplacement],
-) -> Result<String, Box<dyn std::error::Error>> {
-    let ctx_guard = state.whisper_ctx.lock().unwrap();
-    let ctx = match ctx_guard.as_ref() {
-        Some(ctx) => ctx,
-        None => return Err("Модель не загружена".into()),
-    };
-
-    if audio_samples.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut whisper_state = ctx.create_state()?;
+fn build_whisper_params() -> FullParams<'static, 'static> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("ru"));
     params.set_translate(false);
@@ -787,8 +797,26 @@ fn process_audio_pipeline(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    params
+}
 
-    whisper_state.full(params, audio_samples)?;
+fn process_audio_pipeline(
+    state: &Arc<AppState>,
+    audio_samples: &[f32],
+    filler_words: &[String],
+    word_replacements: &[WordReplacement],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if audio_samples.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut state_guard = state.whisper_state.lock().unwrap();
+    let whisper_state = match state_guard.as_mut() {
+        Some(st) => st,
+        None => return Err("Модель не загружена".into()),
+    };
+
+    whisper_state.full(build_whisper_params(), audio_samples)?;
 
     let num_segments = whisper_state.full_n_segments();
     let mut raw_text = String::new();
@@ -853,17 +881,24 @@ fn paste_text(text: &str) {
     let previous_clipboard = clipboard.get_text().ok();
 
     let _ = clipboard.set_text(text.to_string());
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(50));
 
     let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
     let _ = simulate(&EventType::KeyPress(Key::KeyV));
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(10));
     let _ = simulate(&EventType::KeyRelease(Key::KeyV));
     let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+    thread::sleep(Duration::from_millis(20));
 
-    thread::sleep(Duration::from_millis(100));
     if let Some(prev) = previous_clipboard {
-        let _ = clipboard.set_text(prev);
+        // Возвращаем прежнее содержимое буфера в фоне, чтобы не задерживать
+        // основной поток после вставки.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            if let Ok(mut cb) = Clipboard::new() {
+                let _ = cb.set_text(prev);
+            }
+        });
     }
 }
 
@@ -946,22 +981,39 @@ fn start_model_loader(state: Arc<AppState>, ctx: egui::Context, model_path: std:
         }
         ctx.request_repaint();
 
-        match WhisperContext::new_with_params(
-            model_path.to_string_lossy().as_ref(),
-            WhisperContextParameters::default(),
-        ) {
-            Ok(c) => {
-                *state.whisper_ctx.lock().unwrap() = Some(c);
-                let mut st = state.model_status.lock().unwrap();
-                st.phase = ModelPhase::Ready;
-                st.error = None;
-                drop(st);
-            }
+        let ctx_params = WhisperContextParameters {
+            flash_attn: true,
+            ..Default::default()
+        };
+
+        match WhisperContext::new_with_params(model_path.to_string_lossy().as_ref(), ctx_params) {
+            Ok(c) => match c.create_state() {
+                Ok(mut whisper_state) => {
+                    // Прогрев: первый инференс оплачивает инициализацию CUDA-ядер,
+                    // поэтому делаем его сразу после загрузки, а не на первой фразе.
+                    let warmup_samples = vec![0.0f32; 8000];
+                    let _ = whisper_state.full(build_whisper_params(), &warmup_samples);
+
+                    *state.whisper_state.lock().unwrap() = Some(whisper_state);
+                    *state.whisper_ctx.lock().unwrap() = Some(c);
+
+                    let mut load_state = state.model_status.lock().unwrap();
+                    load_state.phase = ModelPhase::Ready;
+                    load_state.error = None;
+                    drop(load_state);
+                }
+                Err(e) => {
+                    let mut load_state = state.model_status.lock().unwrap();
+                    load_state.phase = ModelPhase::Error;
+                    load_state.error = Some(format!("Не удалось создать состояние модели: {}", e));
+                    drop(load_state);
+                }
+            },
             Err(e) => {
-                let mut st = state.model_status.lock().unwrap();
-                st.phase = ModelPhase::Error;
-                st.error = Some(format!("Не удалось загрузить модель: {}", e));
-                drop(st);
+                let mut load_state = state.model_status.lock().unwrap();
+                load_state.phase = ModelPhase::Error;
+                load_state.error = Some(format!("Не удалось загрузить модель: {}", e));
+                drop(load_state);
             }
         }
         ctx.request_repaint();
@@ -1055,6 +1107,7 @@ impl VoiceGUI {
             filler_words: Mutex::new(filler_words),
             word_replacements: Mutex::new(word_replacements),
             whisper_ctx: Mutex::new(None),
+            whisper_state: Mutex::new(None),
             model_status: Mutex::new(ModelLoadState::default()),
             mic_gain: Mutex::new(mic_gain),
             hotkey_record: Mutex::new(record_hotkey),
@@ -1062,7 +1115,13 @@ impl VoiceGUI {
             recording_mode: Mutex::new(recording_mode),
             input_device: Mutex::new(input_device),
             input_devices: Mutex::new(input_devices),
+            capture_buffer: Mutex::new(Vec::new()),
+            capture_sample_rate: AtomicU32::new(16000),
+            capture_channels: AtomicUsize::new(1),
+            pending_audio: Mutex::new(VecDeque::new()),
         });
+
+        start_audio_capture(state.clone());
 
         // Скачивание (при необходимости) и загрузка модели идут в фоне,
         // чтобы не блокировать запуск интерфейса.
@@ -2256,7 +2315,7 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
         let mut prev_exit_down = false;
 
         loop {
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(5));
 
             let mode = *state_for_keys.recording_mode.lock().unwrap();
             let record_down = state_for_keys.hotkey_record.lock().unwrap().is_pressed();
@@ -2293,6 +2352,19 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
             }
             if stop {
                 state_for_keys.is_recording.store(false, Ordering::SeqCst);
+
+                let raw_samples =
+                    std::mem::take(&mut *state_for_keys.capture_buffer.lock().unwrap());
+                let sample_rate = state_for_keys.capture_sample_rate.load(Ordering::SeqCst);
+                let channels = state_for_keys.capture_channels.load(Ordering::SeqCst);
+                if !raw_samples.is_empty() {
+                    state_for_keys
+                        .pending_audio
+                        .lock()
+                        .unwrap()
+                        .push_back((raw_samples, sample_rate, channels));
+                }
+
                 *state_for_keys.status.lock().unwrap() = "⚙ Обработка...".to_string();
                 ctx_for_keys.request_repaint();
             }
@@ -2307,71 +2379,84 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
     });
 
     thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(100));
+        loop {
+            thread::sleep(Duration::from_millis(10));
 
-                if state.is_recording.load(Ordering::SeqCst) {
-                    let audio_samples = {
-                        let state_clone = state.clone();
-                        record_audio_until_stopped(state_clone)
-                    };
+            let pending = state.pending_audio.lock().unwrap().pop_front();
+            let Some((raw_samples, native_rate, channels)) = pending else {
+                continue;
+            };
 
-                    let words_raw = state.filler_words.lock().unwrap().clone();
-                    let replacements_raw = state.word_replacements.lock().unwrap().clone();
+            let words_raw = state.filler_words.lock().unwrap().clone();
+            let replacements_raw = state.word_replacements.lock().unwrap().clone();
 
-                    if !audio_samples.is_empty() {
-                        if state.whisper_ctx.lock().unwrap().is_none() {
-                            *state.status.lock().unwrap() = "⏳ Модель ещё загружается, повторите позже".to_string();
-                            ctx.request_repaint();
-                            continue;
-                        }
+            let mono_samples = downmix_to_mono(&raw_samples, channels);
+            let gain = *state.mic_gain.lock().unwrap();
+            let audio_samples = process_audio_samples(&mono_samples, native_rate, gain);
 
-                        let filler_words = parse_filler_words(&words_raw);
-                        let word_replacements = parse_word_replacements(&replacements_raw);
+            let mut show_idle = true;
 
-                        match process_audio_pipeline(&state, &audio_samples, &filler_words, &word_replacements) {
-                            Ok(final_text) => {
-                                if !final_text.is_empty() {
-                                    paste_text(&final_text);
-                                    let entry = HistoryEntry {
-                                        text: final_text.clone(),
-                                        timestamp: unix_now(),
-                                        app: "неизвестно".to_string(),
-                                    };
-                                    append_history_entry(&entry);
-                                    let mut history = state.history.lock().unwrap();
-                                    history.push(entry);
-                                    if history.len() > HISTORY_MAX_ENTRIES {
-                                        history.remove(0);
-                                        save_history_all(&history);
-                                    }
-                                }
-                            }
-                            Err(e) => {
+            if !audio_samples.is_empty() {
+                if state.whisper_state.lock().unwrap().is_none() {
+                    *state.status.lock().unwrap() =
+                        "⏳ Модель ещё загружается, повторите позже".to_string();
+                    show_idle = false;
+                } else {
+                    let filler_words = parse_filler_words(&words_raw);
+                    let word_replacements = parse_word_replacements(&replacements_raw);
+
+                    match process_audio_pipeline(
+                        &state,
+                        &audio_samples,
+                        &filler_words,
+                        &word_replacements,
+                    ) {
+                        Ok(final_text) => {
+                            if !final_text.is_empty() {
+                                paste_text(&final_text);
                                 let entry = HistoryEntry {
-                                    text: format!("❌ Ошибка: {}", e),
+                                    text: final_text.clone(),
                                     timestamp: unix_now(),
-                                    app: "system".to_string(),
+                                    app: "неизвестно".to_string(),
                                 };
                                 append_history_entry(&entry);
-                                state.history.lock().unwrap().push(entry);
+                                let mut history = state.history.lock().unwrap();
+                                history.push(entry);
+                                if history.len() > HISTORY_MAX_ENTRIES {
+                                    history.remove(0);
+                                    save_history_all(&history);
+                                }
                             }
                         }
-                    }
-
-                    let idle_status = {
-                        let mode = *state.recording_mode.lock().unwrap();
-                        let hk = state.hotkey_record.lock().unwrap().to_string();
-                        match mode {
-                            RecordingMode::Hold => format!("🟢 Ожидание (Зажмите {})", hk),
-                            RecordingMode::Toggle => format!("🟢 Ожидание (Нажмите {})", hk),
+                        Err(e) => {
+                            let entry = HistoryEntry {
+                                text: format!("❌ Ошибка: {}", e),
+                                timestamp: unix_now(),
+                                app: "system".to_string(),
+                            };
+                            append_history_entry(&entry);
+                            state.history.lock().unwrap().push(entry);
                         }
-                    };
-                    *state.status.lock().unwrap() = idle_status;
-                    ctx.request_repaint();
+                    }
                 }
             }
-        });
+
+            let idle_status = {
+                let mode = *state.recording_mode.lock().unwrap();
+                let hk = state.hotkey_record.lock().unwrap().to_string();
+                match mode {
+                    RecordingMode::Hold => format!("🟢 Ожидание (Зажмите {})", hk),
+                    RecordingMode::Toggle => format!("🟢 Ожидание (Нажмите {})", hk),
+                }
+            };
+            let can_go_idle = !state.is_recording.load(Ordering::SeqCst)
+                && state.pending_audio.lock().unwrap().is_empty();
+            if show_idle && can_go_idle {
+                *state.status.lock().unwrap() = idle_status;
+            }
+            ctx.request_repaint();
+        }
+    });
 }
 
 fn main() -> eframe::Result<()> {
