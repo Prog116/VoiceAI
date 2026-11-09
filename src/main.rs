@@ -1,9 +1,9 @@
-#![cfg_attr(not(test), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use arboard::Clipboard;
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
+use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
 use eframe::egui;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(windows)]
 #[repr(C)]
 struct Msg {
     hwnd: *mut std::ffi::c_void,
@@ -30,6 +31,7 @@ struct Msg {
     l_private: u32,
 }
 
+#[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
@@ -44,8 +46,10 @@ extern "system" {
     fn DispatchMessageW(lpMsg: *const Msg) -> isize;
 }
 
+#[cfg(windows)]
 const PM_REMOVE: u32 = 0x0001;
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateMutexW(
@@ -70,35 +74,60 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
+#[cfg(windows)]
 const ERROR_ALREADY_EXISTS: u32 = 183;
+#[cfg(windows)]
 const EVENT_MODIFY_STATE: u32 = 0x0002;
+#[cfg(windows)]
 const INFINITE: u32 = 0xFFFF_FFFF;
+#[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
 
+#[cfg(windows)]
 const SINGLE_INSTANCE_MUTEX: &str = "Local\\VoiceAI_single_instance_mutex";
+#[cfg(windows)]
 const SHOW_EVENT_NAME: &str = "Local\\VoiceAI_show_event";
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
+pub struct InstanceGuard {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
 /// Пытается стать единственным экземпляром приложения.
 /// `None` — приложение уже запущено (новый запуск надо завершить).
-fn acquire_single_instance() -> Option<*mut std::ffi::c_void> {
+#[cfg(windows)]
+fn acquire_single_instance() -> Option<InstanceGuard> {
     let name = wide(SINGLE_INSTANCE_MUTEX);
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
     if handle.is_null() {
-        return Some(handle);
+        return Some(InstanceGuard { handle });
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe { CloseHandle(handle) };
         None
     } else {
-        Some(handle)
+        Some(InstanceGuard { handle })
     }
 }
 
 /// Просит уже запущенный экземпляр показать главное окно.
+#[cfg(windows)]
 fn signal_existing_instance() {
     let name = wide(SHOW_EVENT_NAME);
     let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
@@ -109,6 +138,37 @@ fn signal_existing_instance() {
         }
     }
 }
+
+#[cfg(not(windows))]
+pub struct InstanceGuard {
+    _file: Option<std::fs::File>,
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> Option<InstanceGuard> {
+    use fs2::FileExt;
+
+    let path = std::env::temp_dir().join("voiceai-single-instance.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        // Если файл-замок недоступен, не мешаем приложению запуститься.
+        Err(_) => return Some(InstanceGuard { _file: None }),
+    };
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Some(InstanceGuard { _file: Some(file) }),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(_) => Some(InstanceGuard { _file: None }),
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_existing_instance() {}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct HistoryEntry {
@@ -178,6 +238,7 @@ impl Hotkey {
         }
     }
 
+    #[cfg(windows)]
     pub fn to_vk(&self) -> i32 {
         match self {
             Hotkey::F1 => 0x70, Hotkey::F2 => 0x71, Hotkey::F3 => 0x72, Hotkey::F4 => 0x73,
@@ -204,6 +265,111 @@ impl Hotkey {
     }
 }
 
+#[cfg(not(windows))]
+static PRESSED_KEYS: std::sync::OnceLock<Mutex<std::collections::HashSet<rdev::Key>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(windows))]
+fn start_global_key_listener() {
+    PRESSED_KEYS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    thread::spawn(|| {
+        let result = rdev::listen(|event| {
+            let Some(keys) = PRESSED_KEYS.get() else {
+                return;
+            };
+            match event.event_type {
+                EventType::KeyPress(key) => {
+                    keys.lock().unwrap().insert(key);
+                }
+                EventType::KeyRelease(key) => {
+                    keys.lock().unwrap().remove(&key);
+                }
+                _ => {}
+            }
+        });
+        if let Err(err) = result {
+            eprintln!("Не удалось запустить глобальный перехват клавиш: {err:?}");
+        }
+    });
+}
+
+#[cfg(not(windows))]
+impl Hotkey {
+    fn to_rdev(&self) -> Option<rdev::Key> {
+        use rdev::Key as R;
+        Some(match self {
+            Hotkey::F1 => R::F1,
+            Hotkey::F2 => R::F2,
+            Hotkey::F3 => R::F3,
+            Hotkey::F4 => R::F4,
+            Hotkey::F5 => R::F5,
+            Hotkey::F6 => R::F6,
+            Hotkey::F7 => R::F7,
+            Hotkey::F8 => R::F8,
+            Hotkey::F9 => R::F9,
+            Hotkey::F10 => R::F10,
+            Hotkey::F11 => R::F11,
+            Hotkey::F12 => R::F12,
+            Hotkey::LeftCtrl => R::ControlLeft,
+            Hotkey::RightCtrl => R::ControlRight,
+            Hotkey::LeftAlt => R::Alt,
+            Hotkey::RightAlt => R::AltGr,
+            Hotkey::LeftShift => R::ShiftLeft,
+            Hotkey::RightShift => R::ShiftRight,
+            Hotkey::Space => R::Space,
+            Hotkey::Enter => R::Return,
+            Hotkey::Tab => R::Tab,
+            Hotkey::Backspace => R::Backspace,
+            Hotkey::Delete => R::Delete,
+            Hotkey::Insert => R::Insert,
+            Hotkey::Home => R::Home,
+            Hotkey::End => R::End,
+            Hotkey::PageUp => R::PageUp,
+            Hotkey::PageDown => R::PageDown,
+            Hotkey::Up => R::UpArrow,
+            Hotkey::Down => R::DownArrow,
+            Hotkey::Left => R::LeftArrow,
+            Hotkey::Right => R::RightArrow,
+            Hotkey::Num0 => R::Num0,
+            Hotkey::Num1 => R::Num1,
+            Hotkey::Num2 => R::Num2,
+            Hotkey::Num3 => R::Num3,
+            Hotkey::Num4 => R::Num4,
+            Hotkey::Num5 => R::Num5,
+            Hotkey::Num6 => R::Num6,
+            Hotkey::Num7 => R::Num7,
+            Hotkey::Num8 => R::Num8,
+            Hotkey::Num9 => R::Num9,
+            Hotkey::A => R::KeyA,
+            Hotkey::B => R::KeyB,
+            Hotkey::C => R::KeyC,
+            Hotkey::D => R::KeyD,
+            Hotkey::E => R::KeyE,
+            Hotkey::F => R::KeyF,
+            Hotkey::G => R::KeyG,
+            Hotkey::H => R::KeyH,
+            Hotkey::I => R::KeyI,
+            Hotkey::J => R::KeyJ,
+            Hotkey::K => R::KeyK,
+            Hotkey::L => R::KeyL,
+            Hotkey::M => R::KeyM,
+            Hotkey::N => R::KeyN,
+            Hotkey::O => R::KeyO,
+            Hotkey::P => R::KeyP,
+            Hotkey::Q => R::KeyQ,
+            Hotkey::R => R::KeyR,
+            Hotkey::S => R::KeyS,
+            Hotkey::T => R::KeyT,
+            Hotkey::U => R::KeyU,
+            Hotkey::V => R::KeyV,
+            Hotkey::W => R::KeyW,
+            Hotkey::X => R::KeyX,
+            Hotkey::Y => R::KeyY,
+            Hotkey::Z => R::KeyZ,
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModifierKey {
     Ctrl,
@@ -212,6 +378,7 @@ pub enum ModifierKey {
 }
 
 impl ModifierKey {
+    #[cfg(windows)]
     pub fn to_vk(&self) -> i32 {
         match self {
             ModifierKey::Ctrl => 0x11,
@@ -262,6 +429,7 @@ impl HotkeyBinding {
         HotkeyBinding { modifiers, key }
     }
 
+    #[cfg(windows)]
     pub fn is_pressed(&self) -> bool {
         for m in &self.modifiers {
             if (unsafe { GetAsyncKeyState(m.to_vk()) } as u16 & 0x8000) == 0 {
@@ -269,6 +437,38 @@ impl HotkeyBinding {
             }
         }
         (unsafe { GetAsyncKeyState(self.key.to_vk()) } as u16 & 0x8000) != 0
+    }
+
+    #[cfg(not(windows))]
+    pub fn is_pressed(&self) -> bool {
+        let Some(keys) = PRESSED_KEYS.get() else {
+            return false;
+        };
+        let keys = keys.lock().unwrap();
+
+        for modifier in &self.modifiers {
+            let pressed = match modifier {
+                ModifierKey::Ctrl => {
+                    keys.contains(&rdev::Key::ControlLeft)
+                        || keys.contains(&rdev::Key::ControlRight)
+                }
+                ModifierKey::Alt => {
+                    keys.contains(&rdev::Key::Alt) || keys.contains(&rdev::Key::AltGr)
+                }
+                ModifierKey::Shift => {
+                    keys.contains(&rdev::Key::ShiftLeft)
+                        || keys.contains(&rdev::Key::ShiftRight)
+                }
+            };
+            if !pressed {
+                return false;
+            }
+        }
+
+        match self.key.to_rdev() {
+            Some(key) => keys.contains(&key),
+            None => false,
+        }
     }
 }
 
@@ -625,6 +825,35 @@ fn pick_input_device(host: &cpal::Host, selected: &str) -> Option<cpal::Device> 
     host.default_input_device()
 }
 
+fn build_typed_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    state: Arc<AppState>,
+    stream_error: Arc<AtomicBool>,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let mut was_recording = false;
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let recording = state.is_recording.load(Ordering::SeqCst);
+            if recording {
+                let mut buffer = state.capture_buffer.lock().unwrap();
+                if !was_recording {
+                    buffer.clear();
+                }
+                buffer.extend(data.iter().map(|sample| f32::from_sample(*sample)));
+            }
+            was_recording = recording;
+        },
+        move |_| stream_error.store(true, Ordering::SeqCst),
+        None,
+    )
+}
+
 fn build_capture_stream(
     state: &Arc<AppState>,
     host: &cpal::Host,
@@ -635,28 +864,37 @@ fn build_capture_stream(
     let supported_config = device.default_input_config().ok()?;
     let native_sample_rate = supported_config.sample_rate().0;
     let native_channels = supported_config.channels() as usize;
+    let sample_format = supported_config.sample_format();
     let config: StreamConfig = supported_config.into();
 
-    let state_for_stream = state.clone();
-    let mut was_recording = false;
-    let stream = device
-        .build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let recording = state_for_stream.is_recording.load(Ordering::SeqCst);
-                if recording {
-                    let mut buffer = state_for_stream.capture_buffer.lock().unwrap();
-                    if !was_recording {
-                        buffer.clear();
-                    }
-                    buffer.extend_from_slice(data);
-                }
-                was_recording = recording;
-            },
-            move |_| stream_error.store(true, Ordering::SeqCst),
-            None,
-        )
-        .ok()?;
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            build_typed_stream::<f32>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::I16 => {
+            build_typed_stream::<i16>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::U16 => {
+            build_typed_stream::<u16>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::I8 => {
+            build_typed_stream::<i8>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::U8 => {
+            build_typed_stream::<u8>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::I32 => {
+            build_typed_stream::<i32>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::U32 => {
+            build_typed_stream::<u32>(&device, &config, state.clone(), stream_error.clone())
+        }
+        SampleFormat::F64 => {
+            build_typed_stream::<f64>(&device, &config, state.clone(), stream_error.clone())
+        }
+        _ => return None,
+    }
+    .ok()?;
 
     Some((stream, native_sample_rate, native_channels))
 }
@@ -797,6 +1035,15 @@ fn build_whisper_params() -> FullParams<'static, 'static> {
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let threads = thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
+        params.set_n_threads(threads);
+    }
+
     params
 }
 
@@ -883,13 +1130,29 @@ fn paste_text(text: &str) {
     let _ = clipboard.set_text(text.to_string());
     thread::sleep(Duration::from_millis(50));
 
-    let _ = simulate(&EventType::KeyPress(Key::ControlLeft));
+    #[cfg(target_os = "macos")]
+    let paste_modifier = Key::MetaLeft;
+    #[cfg(not(target_os = "macos"))]
+    let paste_modifier = Key::ControlLeft;
+
+    let _ = simulate(&EventType::KeyPress(paste_modifier));
     let _ = simulate(&EventType::KeyPress(Key::KeyV));
     thread::sleep(Duration::from_millis(10));
     let _ = simulate(&EventType::KeyRelease(Key::KeyV));
-    let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+    let _ = simulate(&EventType::KeyRelease(paste_modifier));
     thread::sleep(Duration::from_millis(20));
 
+    // На X11 содержимое буфера живёт, пока жив объект Clipboard: даём
+    // целевому приложению время прочитать его, затем возвращаем прежний текст.
+    #[cfg(target_os = "linux")]
+    {
+        thread::sleep(Duration::from_millis(150));
+        if let Some(prev) = previous_clipboard {
+            let _ = clipboard.set_text(prev);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     if let Some(prev) = previous_clipboard {
         // Возвращаем прежнее содержимое буфера в фоне, чтобы не задерживать
         // основной поток после вставки.
@@ -961,6 +1224,71 @@ fn download_model(
     Ok(())
 }
 
+/// Определяет, нужно ли просить whisper.cpp использовать GPU.
+/// В сборке без CUDA всегда используется CPU; в Windows-сборке с CUDA
+/// дополнительно проверяется наличие NVIDIA-драйвера.
+fn gpu_requested() -> bool {
+    if !cfg!(feature = "cuda") {
+        return false;
+    }
+
+    match std::env::var("WHISPER_GPU").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") => false,
+        Some("1") | Some("true") | Some("on") => true,
+        _ => cuda_available(),
+    }
+}
+
+#[cfg(all(windows, feature = "cuda"))]
+fn cuda_available() -> bool {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn nvidia_smi_works(program: &str) -> bool {
+        std::process::Command::new(program)
+            .arg("-L")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|out| out.status.success() && !out.stdout.is_empty())
+            .unwrap_or(false)
+    }
+
+    nvidia_smi_works("nvidia-smi")
+        || nvidia_smi_works(r"C:\Windows\System32\nvidia-smi.exe")
+}
+
+#[cfg(not(all(windows, feature = "cuda")))]
+fn cuda_available() -> bool {
+    false
+}
+
+fn load_whisper(
+    model_path: &std::path::Path,
+    use_gpu: bool,
+) -> Result<(WhisperContext, WhisperState), String> {
+    let ctx_params = WhisperContextParameters {
+        use_gpu,
+        flash_attn: use_gpu && cfg!(feature = "cuda"),
+        ..Default::default()
+    };
+
+    let ctx = WhisperContext::new_with_params(model_path, ctx_params)
+        .map_err(|e| format!("не удалось загрузить модель: {e}"))?;
+    let mut state = ctx
+        .create_state()
+        .map_err(|e| format!("не удалось создать состояние модели: {e}"))?;
+
+    // Прогрев: первый инференс оплачивает инициализацию CUDA-ядер,
+    // поэтому делаем его сразу после загрузки, а не на первой фразе.
+    let warmup_samples = vec![0.0f32; 8000];
+    state
+        .full(build_whisper_params(), &warmup_samples)
+        .map_err(|e| format!("не удалось прогреть модель: {e}"))?;
+
+    Ok((ctx, state))
+}
+
 fn start_model_loader(state: Arc<AppState>, ctx: egui::Context, model_path: std::path::PathBuf) {
     thread::spawn(move || {
         if !model_path.exists() {
@@ -981,38 +1309,31 @@ fn start_model_loader(state: Arc<AppState>, ctx: egui::Context, model_path: std:
         }
         ctx.request_repaint();
 
-        let ctx_params = WhisperContextParameters {
-            flash_attn: true,
-            ..Default::default()
-        };
+        let requested_gpu = gpu_requested();
+        let loaded = load_whisper(&model_path, requested_gpu).or_else(|first_error| {
+            if requested_gpu {
+                load_whisper(&model_path, false).map_err(|cpu_error| {
+                    format!("{first_error}; запасной CPU-режим: {cpu_error}")
+                })
+            } else {
+                Err(first_error)
+            }
+        });
 
-        match WhisperContext::new_with_params(model_path.to_string_lossy().as_ref(), ctx_params) {
-            Ok(c) => match c.create_state() {
-                Ok(mut whisper_state) => {
-                    // Прогрев: первый инференс оплачивает инициализацию CUDA-ядер,
-                    // поэтому делаем его сразу после загрузки, а не на первой фразе.
-                    let warmup_samples = vec![0.0f32; 8000];
-                    let _ = whisper_state.full(build_whisper_params(), &warmup_samples);
+        match loaded {
+            Ok((ctx, whisper_state)) => {
+                *state.whisper_state.lock().unwrap() = Some(whisper_state);
+                *state.whisper_ctx.lock().unwrap() = Some(ctx);
 
-                    *state.whisper_state.lock().unwrap() = Some(whisper_state);
-                    *state.whisper_ctx.lock().unwrap() = Some(c);
-
-                    let mut load_state = state.model_status.lock().unwrap();
-                    load_state.phase = ModelPhase::Ready;
-                    load_state.error = None;
-                    drop(load_state);
-                }
-                Err(e) => {
-                    let mut load_state = state.model_status.lock().unwrap();
-                    load_state.phase = ModelPhase::Error;
-                    load_state.error = Some(format!("Не удалось создать состояние модели: {}", e));
-                    drop(load_state);
-                }
-            },
+                let mut load_state = state.model_status.lock().unwrap();
+                load_state.phase = ModelPhase::Ready;
+                load_state.error = None;
+                drop(load_state);
+            }
             Err(e) => {
                 let mut load_state = state.model_status.lock().unwrap();
                 load_state.phase = ModelPhase::Error;
-                load_state.error = Some(format!("Не удалось загрузить модель: {}", e));
+                load_state.error = Some(e);
                 drop(load_state);
             }
         }
@@ -1027,23 +1348,26 @@ fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     // egui поставляется с ограниченным набором эмодзи, из-за чего часть
-    // символов рисуется «квадратиками». Добавляем системный шрифт символов
-    // Windows (содержит таблицу glyf, поэтому egui умеет его растеризовать).
-    let candidates = [
-        "C:\\Windows\\Fonts\\seguiemj.ttf",
-        "C:\\Windows\\Fonts\\seguisym.ttf",
-    ];
-    if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
-        let name = "system_symbols".to_owned();
-        fonts
-            .font_data
-            .insert(name.clone(), egui::FontData::from_owned(bytes));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+    // символов рисуется «квадратиками». На Windows добавляем системный шрифт
+    // символов (содержит таблицу glyf, поэтому egui умеет его растеризовать).
+    #[cfg(windows)]
+    {
+        let candidates = [
+            "C:\\Windows\\Fonts\\seguiemj.ttf",
+            "C:\\Windows\\Fonts\\seguisym.ttf",
+        ];
+        if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+            let name = "system_symbols".to_owned();
             fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push(name.clone());
+                .font_data
+                .insert(name.clone(), egui::FontData::from_owned(bytes));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push(name.clone());
+            }
         }
     }
 
@@ -1122,6 +1446,9 @@ impl VoiceGUI {
         });
 
         start_audio_capture(state.clone());
+
+        #[cfg(not(windows))]
+        start_global_key_listener();
 
         // Скачивание (при необходимости) и загрузка модели идут в фоне,
         // чтобы не блокировать запуск интерфейса.
@@ -1241,6 +1568,7 @@ fn start_widget_repaint_loop(ctx: egui::Context) {
     });
 }
 
+#[cfg(windows)]
 fn start_show_signal_worker(ctx: egui::Context, main_hidden: Arc<AtomicBool>) {
     thread::spawn(move || {
         let name = wide(SHOW_EVENT_NAME);
@@ -1266,6 +1594,9 @@ fn start_show_signal_worker(ctx: egui::Context, main_hidden: Arc<AtomicBool>) {
     });
 }
 
+#[cfg(not(windows))]
+fn start_show_signal_worker(_ctx: egui::Context, _main_hidden: Arc<AtomicBool>) {}
+
 fn show_main_window(ctx: &egui::Context, hidden: &Arc<AtomicBool>) {
     hidden.store(false, Ordering::Relaxed);
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
@@ -1274,6 +1605,7 @@ fn show_main_window(ctx: &egui::Context, hidden: &Arc<AtomicBool>) {
 }
 
 /// Рисует круглую иконку для трея.
+#[cfg(any(windows, test))]
 fn circle_rgba(size: u32, color: [u8; 4]) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let r = size as f32 / 2.0;
@@ -1294,6 +1626,7 @@ fn circle_rgba(size: u32, color: [u8; 4]) -> Vec<u8> {
     buf
 }
 
+#[cfg(windows)]
 fn make_circle_icon(size: u32, color: [u8; 4]) -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(circle_rgba(size, color), size, size).ok()
 }
@@ -1302,6 +1635,7 @@ fn make_circle_icon(size: u32, color: [u8; 4]) -> Option<tray_icon::Icon> {
 /// сообщений. Иконка синяя в покое и красная во время записи; клик по ней
 /// (или пункт меню «Открыть») возвращает главное окно. Возвращает `true`,
 /// если трей удалось создать.
+#[cfg(windows)]
 fn start_tray(ctx: egui::Context, state: Arc<AppState>, main_hidden: Arc<AtomicBool>) -> bool {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
@@ -1397,6 +1731,11 @@ fn start_tray(ctx: egui::Context, state: Arc<AppState>, main_hidden: Arc<AtomicB
     });
 
     rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn start_tray(_ctx: egui::Context, _state: Arc<AppState>, _main_hidden: Arc<AtomicBool>) -> bool {
+    false
 }
 
 /// Рисует содержимое мини-виджета. Вызывается как deferred viewport,
