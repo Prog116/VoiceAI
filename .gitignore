@@ -5,3 +5,4 @@
 *.wav
 history.jsonl
 models/
+recordings/

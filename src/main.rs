@@ -175,6 +175,8 @@ struct HistoryEntry {
     text: String,
     timestamp: u64,
     app: String,
+    #[serde(default)]
+    audio_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -706,6 +708,12 @@ fn save_history_all(entries: &[HistoryEntry]) {
     }
 }
 
+fn remove_entry_audio(entry: &HistoryEntry) {
+    if let Some(path) = &entry.audio_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn export_history(entries: &[HistoryEntry]) -> std::io::Result<String> {
     let filename = format!("export_{}.jsonl", unix_now());
     let mut file = std::fs::File::create(&filename)?;
@@ -769,6 +777,11 @@ fn parse_recording_mode(raw: &str) -> RecordingMode {
     }
 }
 
+enum PlaybackCommand {
+    Play(std::path::PathBuf),
+    Stop,
+}
+
 struct AppState {
     pub is_recording: AtomicBool,
     pub status: Mutex<String>,
@@ -789,6 +802,8 @@ struct AppState {
     pub capture_sample_rate: AtomicU32,
     pub capture_channels: AtomicUsize,
     pub pending_audio: Mutex<VecDeque<(Vec<f32>, u32, usize)>>,
+    pub player_tx: std::sync::mpsc::Sender<PlaybackCommand>,
+    pub playing_audio: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 #[derive(PartialEq)]
@@ -937,6 +952,57 @@ fn start_audio_capture(state: Arc<AppState>) {
     });
 }
 
+fn start_audio_player(
+    rx: std::sync::mpsc::Receiver<PlaybackCommand>,
+    now_playing: Arc<Mutex<Option<std::path::PathBuf>>>,
+) {
+    thread::spawn(move || {
+        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+            return;
+        };
+
+        let mut sink: Option<rodio::Sink> = None;
+
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(PlaybackCommand::Play(path)) => {
+                    if let Some(old) = sink.take() {
+                        old.stop();
+                    }
+                    *now_playing.lock().unwrap() = None;
+
+                    let Ok(file) = std::fs::File::open(&path) else {
+                        continue;
+                    };
+                    let Ok(source) = rodio::Decoder::new(std::io::BufReader::new(file)) else {
+                        continue;
+                    };
+                    if let Ok(new_sink) = rodio::Sink::try_new(&handle) {
+                        new_sink.append(source);
+                        new_sink.play();
+                        *now_playing.lock().unwrap() = Some(path);
+                        sink = Some(new_sink);
+                    }
+                }
+                Ok(PlaybackCommand::Stop) => {
+                    if let Some(old) = sink.take() {
+                        old.stop();
+                    }
+                    *now_playing.lock().unwrap() = None;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let finished = sink.as_ref().is_some_and(|s| s.empty());
+                    if finished {
+                        sink = None;
+                        *now_playing.lock().unwrap() = None;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+}
+
 fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
@@ -973,6 +1039,34 @@ fn process_audio_samples(samples: &[f32], sample_rate: u32, gain: f32) -> Vec<f3
     normalize_audio_aggressive(&mut resampled);
 
     resampled
+}
+
+fn save_recording_wav(samples: &[f32]) -> Option<std::path::PathBuf> {
+    let dir = std::env::current_dir()
+        .map(|cwd| cwd.join("recordings"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("recordings"));
+    std::fs::create_dir_all(&dir).ok()?;
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("rec_{millis}.wav"));
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec).ok()?;
+    for &sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer.write_sample(value).ok()?;
+    }
+    writer.finalize().ok()?;
+
+    Some(path)
 }
 
 fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -1423,6 +1517,10 @@ impl VoiceGUI {
         let input_device = std::env::var("INPUT_DEVICE").unwrap_or_default();
         let input_devices = list_input_devices();
 
+        let (player_tx, player_rx) = std::sync::mpsc::channel();
+        let playing_audio: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+        start_audio_player(player_rx, playing_audio.clone());
+
         let state = Arc::new(AppState {
             is_recording: AtomicBool::new(false),
             status: Mutex::new(initial_status),
@@ -1443,6 +1541,8 @@ impl VoiceGUI {
             capture_sample_rate: AtomicU32::new(16000),
             capture_channels: AtomicUsize::new(1),
             pending_audio: Mutex::new(VecDeque::new()),
+            player_tx,
+            playing_audio,
         });
 
         start_audio_capture(state.clone());
@@ -1977,7 +2077,12 @@ ctx.set_style(style);
                             .hint_text("🔍 Поиск...")
                             .desired_width(200.0));
                         if ui.button("🗑 Очистить").clicked() {
-                            self.state.history.lock().unwrap().clear();
+                            let _ = self.state.player_tx.send(PlaybackCommand::Stop);
+                            let mut history = self.state.history.lock().unwrap();
+                            for entry in history.iter() {
+                                remove_entry_audio(entry);
+                            }
+                            history.clear();
                             save_history_all(&[]);
                         }
                         if ui.button("💾 Экспорт").clicked() {
@@ -2166,6 +2271,36 @@ ctx.set_style(style);
                                                     let _ = cb.set_text(entry.text.clone());
                                                 }
                                             }
+                                            if let Some(audio_path) = &entry.audio_path {
+                                                let path = std::path::Path::new(audio_path);
+                                                if path.exists() {
+                                                    let path_buf = path.to_path_buf();
+                                                    let is_playing = self
+                                                        .state
+                                                        .playing_audio
+                                                        .lock()
+                                                        .unwrap()
+                                                        .as_ref()
+                                                        .is_some_and(|playing| playing == &path_buf);
+                                                    let (label, hint) = if is_playing {
+                                                        ("⏹", "Остановить")
+                                                    } else {
+                                                        ("▶", "Прослушать")
+                                                    };
+                                                    if ui
+                                                        .small_button(label)
+                                                        .on_hover_text(hint)
+                                                        .clicked()
+                                                    {
+                                                        let command = if is_playing {
+                                                            PlaybackCommand::Stop
+                                                        } else {
+                                                            PlaybackCommand::Play(path_buf)
+                                                        };
+                                                        let _ = self.state.player_tx.send(command);
+                                                    }
+                                                }
+                                            }
                                         },
                                     );
                                 });
@@ -2181,7 +2316,16 @@ ctx.set_style(style);
                             }
 
                             if let Some(i) = to_delete {
-                                history.remove(i);
+                                let removed = history.remove(i);
+                                let playing_path = self.state.playing_audio.lock().unwrap().clone();
+                                if let Some(audio_path) = &removed.audio_path {
+                                    if playing_path.as_deref()
+                                        == Some(std::path::Path::new(audio_path))
+                                    {
+                                        let _ = self.state.player_tx.send(PlaybackCommand::Stop);
+                                    }
+                                }
+                                remove_entry_audio(&removed);
                                 save_history_all(&history);
                             }
                         });
@@ -2741,6 +2885,10 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                         "⏳ Модель ещё загружается, повторите позже".to_string();
                     show_idle = false;
                 } else {
+                    let audio_path = save_recording_wav(&audio_samples);
+                    let audio_path_str = audio_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string());
                     let filler_words = parse_filler_words(&words_raw);
                     let word_replacements = parse_word_replacements(&replacements_raw);
 
@@ -2757,14 +2905,18 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                                     text: final_text.clone(),
                                     timestamp: unix_now(),
                                     app: "неизвестно".to_string(),
+                                    audio_path: audio_path_str,
                                 };
                                 append_history_entry(&entry);
                                 let mut history = state.history.lock().unwrap();
                                 history.push(entry);
                                 if history.len() > HISTORY_MAX_ENTRIES {
-                                    history.remove(0);
+                                    let removed = history.remove(0);
+                                    remove_entry_audio(&removed);
                                     save_history_all(&history);
                                 }
+                            } else if let Some(path) = &audio_path {
+                                let _ = std::fs::remove_file(path);
                             }
                         }
                         Err(e) => {
@@ -2772,6 +2924,7 @@ fn start_background_workers(state: Arc<AppState>, ctx: egui::Context) {
                                 text: format!("❌ Ошибка: {}", e),
                                 timestamp: unix_now(),
                                 app: "system".to_string(),
+                                audio_path: audio_path_str,
                             };
                             append_history_entry(&entry);
                             state.history.lock().unwrap().push(entry);
@@ -2829,6 +2982,14 @@ mod tests {
         let filler_words = vec!["эм".to_string()];
         let result = clean_text_locally("привет эм как дела", &filler_words);
         assert_eq!(result, "Привет как дела.");
+    }
+
+    #[test]
+    fn history_entry_without_audio_path_deserializes() {
+        let entry: HistoryEntry =
+            serde_json::from_str(r#"{"text":"привет","timestamp":1,"app":"test"}"#).unwrap();
+        assert_eq!(entry.text, "привет");
+        assert!(entry.audio_path.is_none());
     }
 
     #[test]
